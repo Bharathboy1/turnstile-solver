@@ -803,6 +803,8 @@
                 <select id="r_ep">
                   <option>/solve</option>
                   <option>/solve-challenge</option>
+                  <option>/recaptcha-v3</option>
+                  <option>/aws-token</option>
                 </select>
               </div>
               <div class="field">
@@ -887,6 +889,10 @@
     <script>
       const $ = (id) => document.getElementById(id);
       const BASE = `${location.protocol}//${location.host}`;
+      // API key: taken from ?api_key= on the playground URL, sent on every
+      // request as X-API-Key (the server also accepts ?api_key=).
+      const API_KEY = new URLSearchParams(location.search).get("api_key") || "";
+      const authHeaders = () => (API_KEY ? { "X-API-Key": API_KEY } : {});
   
 
       document.querySelectorAll(".tabs").forEach((group) => {
@@ -1015,7 +1021,7 @@
         try {
           const r = await fetch(BASE + endpoint, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...authHeaders() },
             body: JSON.stringify(body),
           });
           const ct = r.headers.get("content-type") || "";
@@ -1066,7 +1072,7 @@ console.log(data);`;
 res = requests.post(
     "${url}",
     json=${py},
-    timeout=${(body.timeout || 45) + 15},
+    timeout=${(body.timeout || 45) + 30},
 )
 res.raise_for_status()
 print(res.json())`;
@@ -1078,7 +1084,7 @@ curl_setopt_array($ch, [
     CURLOPT_HTTPHEADER => ["Content-Type: application/json"],
     CURLOPT_POSTFIELDS => json_encode(${phpArr(body)}),
     CURLOPT_RETURNTRANSFER => true,
-    CURLOPT_TIMEOUT => ${(body.timeout || 45) + 15},
+    CURLOPT_TIMEOUT => ${(body.timeout || 45) + 30},
 ]);
 echo curl_exec($ch);
 curl_close($ch);`;
@@ -1180,7 +1186,7 @@ func main() {
       let lastTotal = -1;
       async function refreshStats() {
         try {
-          const r = await fetch(BASE + "/stats", { cache: "no-store" });
+          const r = await fetch(BASE + "/stats", { cache: "no-store", headers: authHeaders() });
           if (!r.ok) return;
           const s = await r.json();
           const modeEl = $("h_mode");

@@ -32,7 +32,10 @@ services:
       byparr:
         condition: service_healthy
     ports:
-      - "9988:9988"
+      # Loopback only: the reverse proxy on the host fronts this. Publishing
+      # on 0.0.0.0 let anyone hit the port directly, spoof X-Forwarded-For
+      # and dodge the per-IP bans. Use "0.0.0.0:9988:9988" only with API_KEY set.
+      - "127.0.0.1:9988:9988"
     environment:
       # Concurrent solves. Each headed Camoufox tab ~150-250MB + CPU; tune to
       # the box (4 vCPU / ~3GB free → ~12). Different sitekeys run in parallel

@@ -23,12 +23,14 @@ Design notes:
 """
 
 import asyncio
+import contextlib
+import html
 import json
 import logging
 import os
 import random
 import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
 import aiohttp
@@ -81,33 +83,37 @@ class BrowserSingleton:
         self.sem = asyncio.Semaphore(max_concurrent)
         # Per-key locks: CF escalates difficulty when the SAME sitekey is hit
         # by concurrent tabs of one profile, so we serialise per key — but let
-        # different keys/sites run in parallel up to the semaphore. A single
-        # global lock here would serialise everything and make sem pointless.
+        # different keys/sites run in parallel up to the semaphore. Locks are
+        # refcounted and dropped when idle so unique keys can't grow the dict.
         self._key_locks: dict[str, asyncio.Lock] = {}
+        self._key_refs: dict[str, int] = {}
         self.max_concurrent = max_concurrent
         self._start_lock = asyncio.Lock()
         self.solve_count = 0
         self.stopped = False
+        # Bumped on every launch. A solve that saw the browser die passes the
+        # generation it was using to shutdown(); if another solve already
+        # relaunched, the request is ignored instead of killing the new browser.
+        self.generation = 0
 
-    def key_lock(self, key: str) -> asyncio.Lock:
-        """Lock scoped to a sitekey/URL so same-key solves stay serial while
-        different keys run concurrently."""
-        lock = self._key_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._key_locks[key] = lock
-        return lock
+    @contextlib.asynccontextmanager
+    async def keyed(self, key: str):
+        """Serialise same-key solves; different keys run concurrently."""
+        lock = self._key_locks.setdefault(key, asyncio.Lock())
+        self._key_refs[key] = self._key_refs.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._key_refs[key] -= 1
+            if self._key_refs[key] == 0:
+                del self._key_refs[key]
+                del self._key_locks[key]
 
     def _is_alive(self) -> bool:
-        if self.browser is None or self.stopped:
-            return False
-        try:
-            b = getattr(self.browser, "browser", None)
-            if b is not None and hasattr(b, "is_connected"):
-                return bool(b.is_connected())
-            return True
-        except Exception:
-            return False
+        # Persistent contexts have no .browser handle, so liveness comes from
+        # the context "close" event wired up in ensure().
+        return self.browser is not None and not self.stopped
 
     async def ensure(self):
         async with self._start_lock:
@@ -137,7 +143,6 @@ class BrowserSingleton:
                 os=["windows", "macos", "linux"],
                 locale="en-US",
                 exclude_addons=[DefaultAddons.UBO],
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
             )
             if proxy:
                 # geoip=True aligns the spoofed timezone/locale with the
@@ -147,7 +152,16 @@ class BrowserSingleton:
             self._camoufox = AsyncCamoufox(**kwargs)
             self.browser = await self._camoufox.__aenter__()
             self.stopped = False
-            log.info("camoufox ready")
+            self.generation += 1
+            gen = self.generation
+
+            def _on_close(_ctx):
+                if self.generation == gen:
+                    log.warning("browser context closed (gen %d)", gen)
+                    self.stopped = True
+
+            self.browser.on("close", _on_close)
+            log.info("camoufox ready (gen %d)", gen)
 
     async def new_page(self, url: str = ""):
         await self.ensure()
@@ -159,8 +173,13 @@ class BrowserSingleton:
                 log.warning("initial goto failed: %s", e)
         return page
 
-    async def shutdown(self):
-        if self.stopped:
+    async def shutdown(self, generation: Optional[int] = None):
+        """Tear the browser down. With `generation`, only if that generation
+        is still the live one (a dead-browser report about an old launch must
+        not kill the relaunched browser others are already using)."""
+        if generation is not None and generation != self.generation:
+            return
+        if self.stopped and self.browser is None:
             return
         self.stopped = True
         if self._camoufox is not None:
@@ -186,6 +205,55 @@ async def get_pool(size: Optional[int] = None) -> BrowserSingleton:
             _pool = BrowserSingleton(n)
             await _pool.ensure()
         return _pool
+
+
+_DEAD_BROWSER_HINTS = (
+    "connection closed",
+    "browser has been closed",
+    "target page, context or browser has been closed",
+    "browser context has been closed",
+)
+
+
+def _is_dead_browser_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(h in msg for h in _DEAD_BROWSER_HINTS)
+
+
+async def _run_in_tab(key: str, url: str, req_id: str,
+                      fn: Callable[[object, BrowserSingleton], Awaitable]):
+    """Common tab lifecycle for every solve: key lock (outer, so same-key
+    waiters don't hold worker slots), semaphore (inner), one retry on a dead
+    browser, page cleanup."""
+    pool = await get_pool()
+    async with pool.keyed(key):
+        async with pool.sem:
+            for attempt in (1, 2):
+                page = None
+                gen = pool.generation
+                try:
+                    page = await pool.new_page(url)
+                    gen = pool.generation
+                    result = await fn(page, pool)
+                    pool.solve_count += 1
+                    return result
+                except Exception as exc:
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown(gen)
+                        continue
+                    raise
+                finally:
+                    if page is not None:
+                        try:
+                            await page.unroute_all()
+                        except Exception:
+                            pass
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+            raise RuntimeError("_run_in_tab: unreachable")
 
 
 # ---------- Turnstile injection ----------
@@ -217,6 +285,10 @@ _IS_CHALLENGE_JS = """
 """
 
 
+def _attr(v: str) -> str:
+    return html.escape(str(v), quote=True)
+
+
 async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
                               timeout: int, action: Optional[str] = None,
                               cdata: Optional[str] = None) -> str:
@@ -226,19 +298,19 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
 
     target = siteurl if siteurl.endswith("/") else siteurl + "/"
 
+    # Attribute-escaped: the host page is served under the target's origin
+    # inside the shared persistent profile, so raw interpolation would let a
+    # caller run script with that origin's cookies.
     widget_div = (
-        f'<div class="cf-turnstile" style="background:white;" data-sitekey="{sitekey}"'
-        + (f' data-action="{action}"' if action else "")
-        + (f' data-cdata="{cdata}"' if cdata else "")
+        f'<div class="cf-turnstile" style="background:white;" data-sitekey="{_attr(sitekey)}"'
+        + (f' data-action="{_attr(action)}"' if action else "")
+        + (f' data-cdata="{_attr(cdata)}"' if cdata else "")
         + "></div>"
     )
     body = _HOST_HTML.replace("__WIDGET__", widget_div)
 
-    try:
-        await page.unroute_all()
-    except Exception:
-        pass
-    await page.route(target, lambda route: route.fulfill(body=body, status=200))
+    await page.route(target, lambda route: route.fulfill(
+        body=body, status=200, content_type="text/html; charset=utf-8"))
     await page.goto(target)
     _step(req_id, f"route intercepted {target}")
 
@@ -251,7 +323,6 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
     except Exception:
         pass
 
-    # 80 x 0.3s = 24s default; we follow the caller's timeout instead.
     deadline = t0 + timeout
     poll = 0.3
     while loop.time() < deadline:
@@ -272,52 +343,15 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
     raise TimeoutError(f"turnstile timeout after {timeout}s")
 
 
-_DEAD_BROWSER_HINTS = (
-    "connection closed",
-    "browser has been closed",
-    "target page, context or browser has been closed",
-    "browser context has been closed",
-)
-
-
-def _is_dead_browser_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return any(h in msg for h in _DEAD_BROWSER_HINTS)
-
-
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       timeout: int = 45, action: Optional[str] = None,
                       cdata: Optional[str] = None) -> str:
-    pool = await get_pool()
-    async with pool.sem:
-        async with pool.key_lock(sitekey):
-            _step(req_id, f"opening tab for {siteurl}")
-            for attempt in (1, 2):
-                page = None
-                try:
-                    await pool.ensure()
-                    page = await pool.browser.new_page()
-                    return await _turnstile_on_page(
-                        page, sitekey, siteurl, req_id, timeout, action, cdata
-                    )
-                except Exception as exc:
-                    if attempt == 1 and _is_dead_browser_error(exc):
-                        _step(req_id, f"browser dead, relaunching: {exc}")
-                        await pool.shutdown()
-                        continue
-                    raise
-                finally:
-                    pool.solve_count += 1
-                    if page is not None:
-                        try:
-                            await page.unroute_all()
-                        except Exception:
-                            pass
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-            raise RuntimeError("solve_async: unreachable")
+    _step(req_id, f"opening tab for {siteurl}")
+
+    async def run(page, _pool):
+        return await _turnstile_on_page(page, sitekey, siteurl, req_id, timeout, action, cdata)
+
+    return await _run_in_tab(sitekey, "", req_id, run)
 
 
 # ---------- JS Challenge ("Just a moment...") ----------
@@ -343,7 +377,7 @@ _CF_WIDGET_RECT_JS = """
 def _match_host(target_host: str, cdomain: str) -> bool:
     d = (cdomain or "").lstrip(".").lower()
     h = (target_host or "").lower()
-    return bool(h) and (h == d or h.endswith("." + d))
+    return bool(h) and bool(d) and (h == d or h.endswith("." + d))
 
 
 def _challenge_proxy() -> tuple[Optional[str], str]:
@@ -397,11 +431,17 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
                 async with s.post(f"{url}/v1", json=payload) as resp:
                     body_text = await resp.text()
                     if resp.status == 200:
-                        data = json.loads(body_text)
-                        if (data.get("status") or "").lower() == "ok":
+                        try:
+                            parsed = json.loads(body_text)
+                        except ValueError:
+                            parsed = None
+                        if not isinstance(parsed, dict):
+                            last_err = f"{kind}: non-JSON response: {body_text[:200]}"
+                            continue
+                        if (parsed.get("status") or "").lower() == "ok":
+                            data = parsed
                             break
-                        last_err = f"{kind}: {data.get('message') or data}"
-                        data = None
+                        last_err = f"{kind}: {parsed.get('message') or parsed}"
                         continue
                     last_err = f"{kind} HTTP {resp.status}: {body_text[:200]}"
         except asyncio.TimeoutError:
@@ -428,15 +468,15 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
             "expires": c.get("expiry") if c.get("expiry") is not None else c.get("expires", -1),
         })
 
-    html = sol.get("response") or ""
+    html_ = sol.get("response") or ""
     title = ""
-    low = html.lower()
+    low = html_.lower()
     a = low.find("<title")
     if a != -1:
         b = low.find(">", a)
         c_ = low.find("</title>", b)
         if b != -1 and c_ != -1:
-            title = html[b + 1:c_].strip()
+            title = html_[b + 1:c_].strip()
 
     user_agent = sol.get("userAgent") or sol.get("user_agent") or ""
     _step(req_id, f"{kind} cleared ({loop.time() - t0:.1f}s, cookies={len(cookies)})")
@@ -445,7 +485,7 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
         "title": title,
         "user_agent": user_agent,
         "cookies": cookies,
-        "html": html,
+        "html": html_,
     }
 
 
@@ -463,101 +503,78 @@ async def solve_challenge_async(siteurl: str, req_id: str = "-",
             if result is not None:
                 return result
         except Exception as e:
-            _step(req_id, f"{proxy_kind or 'proxy'} failed, falling back to camoufox: {e}")
+            log.warning("[%s] %s failed, falling back to camoufox: %s",
+                        req_id, proxy_kind or "proxy", e)
 
-    pool = await get_pool()
-    async with pool.sem:
-        async with pool.key_lock(siteurl):
-            _step(req_id, f"opening tab -> {siteurl}")
-            for attempt in (1, 2):
-                page = None
-                try:
-                    page = await pool.new_page(siteurl)
-                    loop = asyncio.get_event_loop()
-                    t0 = loop.time()
-                    _step(req_id, "waiting for navigation...")
+    _step(req_id, f"opening tab -> {siteurl}")
+
+    async def run(page, pool):
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        deadline = t0 + timeout
+        cleared = False
+        attempts = 0
+        clicks = 0
+        last_click = 0.0
+
+        while loop.time() < deadline:
+            is_challenge = await page.evaluate(_IS_CHALLENGE_JS)
+            if not is_challenge:
+                cleared = True
+                break
+            attempts += 1
+            if attempts == 1:
+                _step(req_id, "CF challenge detected, waiting for clear...")
+
+            now = loop.time()
+            if clicks < 3 and (clicks == 0 or now - last_click > 6):
+                rect = await page.evaluate(_CF_WIDGET_RECT_JS)
+                if rect:
+                    cx = rect["x"] + 28 + random.uniform(-3, 3)
+                    cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
+                    _step(req_id, f"interactive click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
                     try:
-                        await page.wait_for_load_state("domcontentloaded", timeout=15_000)
-                    except Exception:
-                        pass
-                    _step(req_id, f"page loaded ({loop.time() - t0:.1f}s)")
-
-                    deadline = t0 + timeout
-                    cleared = False
-                    attempts = 0
-                    clicks = 0
-                    last_click = 0.0
-
-                    while loop.time() < deadline:
-                        is_challenge = await page.evaluate(_IS_CHALLENGE_JS)
-                        if not is_challenge:
-                            cleared = True
-                            break
-                        attempts += 1
-                        if attempts == 1:
-                            _step(req_id, "CF challenge detected, waiting for clear...")
-
-                        now = loop.time()
-                        if clicks < 3 and (clicks == 0 or now - last_click > 6):
-                            rect = await page.evaluate(_CF_WIDGET_RECT_JS)
-                            if rect:
-                                cx = rect["x"] + 28 + random.uniform(-3, 3)
-                                cy = rect["y"] + rect["h"] / 2 + random.uniform(-3, 3)
-                                _step(req_id, f"interactive click #{clicks + 1} at ({cx:.0f},{cy:.0f})")
-                                try:
-                                    await page.mouse.move(cx - 60, cy - 20)
-                                    await asyncio.sleep(0.05)
-                                    await page.mouse.move(cx, cy)
-                                    await asyncio.sleep(0.03)
-                                    await page.mouse.click(cx, cy)
-                                except Exception as e:
-                                    _step(req_id, f"click error: {e}")
-                                last_click = now
-                                clicks += 1
-                        await asyncio.sleep(0.3)
-
-                    if not cleared:
-                        raise TimeoutError(f"challenge did not clear within {timeout}s")
-
-                    final_url = page.url
-                    title = await page.title()
-                    user_agent = await page.evaluate("navigator.userAgent")
-                    html = await page.content()
-                    target_host = urlparse(final_url or siteurl).hostname or ""
-                    try:
-                        raw_cookies = await pool.browser.cookies()
-                        cookies = [
-                            {"name": c["name"], "value": c["value"], "domain": c["domain"],
-                             "path": c["path"], "expires": c.get("expires", -1)}
-                            for c in raw_cookies
-                            if _match_host(target_host, c.get("domain", ""))
-                        ]
+                        await page.mouse.move(cx - 60, cy - 20)
+                        await asyncio.sleep(0.05)
+                        await page.mouse.move(cx, cy)
+                        await asyncio.sleep(0.03)
+                        await page.mouse.click(cx, cy)
                     except Exception as e:
-                        _step(req_id, f"cookie fetch failed: {e}")
-                        cookies = []
+                        _step(req_id, f"click error: {e}")
+                    last_click = now
+                    clicks += 1
+            await asyncio.sleep(0.3)
 
-                    _step(req_id, f"challenge cleared ({loop.time() - t0:.1f}s, attempts={attempts})")
-                    return {
-                        "url": final_url,
-                        "title": title,
-                        "user_agent": user_agent,
-                        "cookies": cookies,
-                        "html": html,
-                    }
-                except Exception as exc:
-                    if attempt == 1 and _is_dead_browser_error(exc):
-                        _step(req_id, f"browser dead, relaunching: {exc}")
-                        await pool.shutdown()
-                        continue
-                    raise
-                finally:
-                    pool.solve_count += 1
-                    if page is not None:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-            raise RuntimeError("solve_challenge_async: unreachable")
+        if not cleared:
+            raise TimeoutError(f"challenge did not clear within {timeout}s")
+
+        final_url = page.url
+        title = await page.title()
+        user_agent = await page.evaluate("navigator.userAgent")
+        html_ = await page.content()
+        target_host = urlparse(final_url or siteurl).hostname or ""
+        try:
+            raw_cookies = await pool.browser.cookies(final_url or siteurl)
+            cookies = [
+                {"name": c["name"], "value": c["value"], "domain": c["domain"],
+                 "path": c["path"], "expires": c.get("expires", -1)}
+                for c in raw_cookies
+                if _match_host(target_host, c.get("domain", ""))
+            ]
+        except Exception as e:
+            _step(req_id, f"cookie fetch failed: {e}")
+            cookies = []
+
+        _step(req_id, f"challenge cleared ({loop.time() - t0:.1f}s, attempts={attempts})")
+        return {
+            "url": final_url,
+            "title": title,
+            "user_agent": user_agent,
+            "cookies": cookies,
+            "html": html_,
+        }
+
+    return await _run_in_tab(siteurl, siteurl, req_id, run)
 
 
 # ---------- reCAPTCHA v3 (Boterdrop pattern) ----------
@@ -598,36 +615,22 @@ async def solve_recaptcha_v3_async(sitekey: str, siteurl: str, req_id: str = "-"
     """Load the target page, ensure grecaptcha is present (inject api.js if
     not), then run grecaptcha.execute to mint a v3 token. Score-based, so a
     clean Camoufox fingerprint + WARP egress is what makes it pass."""
-    pool = await get_pool()
-    async with pool.sem:
-        async with pool.key_lock(sitekey):
-            for attempt in (1, 2):
-                page = None
-                try:
-                    _step(req_id, f"recaptcha v3 -> {siteurl} (action={action})")
-                    page = await pool.new_page(siteurl)
-                    if not await page.evaluate(_RECAPTCHA_READY_JS):
-                        _step(req_id, "grecaptcha absent, injecting api.js")
-                        await page.evaluate(_RECAPTCHA_INJECT_JS, sitekey)
-                    token = await page.evaluate(_RECAPTCHA_EXEC_JS, [sitekey, action])
-                    if not token:
-                        raise RuntimeError("recaptcha returned empty token")
-                    _step(req_id, "recaptcha token obtained")
-                    return token
-                except Exception as exc:
-                    if attempt == 1 and _is_dead_browser_error(exc):
-                        _step(req_id, f"browser dead, relaunching: {exc}")
-                        await pool.shutdown()
-                        continue
-                    raise
-                finally:
-                    pool.solve_count += 1
-                    if page is not None:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-            raise RuntimeError("solve_recaptcha_v3_async: unreachable")
+    _step(req_id, f"recaptcha v3 -> {siteurl} (action={action})")
+
+    async def run(page, _pool):
+        if not await page.evaluate(_RECAPTCHA_READY_JS):
+            _step(req_id, "grecaptcha absent, injecting api.js")
+            await page.evaluate(_RECAPTCHA_INJECT_JS, sitekey)
+        # grecaptcha.ready never firing would otherwise hang this evaluate
+        # forever and pin a worker slot.
+        token = await asyncio.wait_for(
+            page.evaluate(_RECAPTCHA_EXEC_JS, [sitekey, action]), timeout)
+        if not token:
+            raise RuntimeError("recaptcha returned empty token")
+        _step(req_id, "recaptcha token obtained")
+        return token
+
+    return await _run_in_tab(sitekey, siteurl, req_id, run)
 
 
 # ---------- AWS WAF token (Boterdrop pattern) ----------
@@ -636,48 +639,33 @@ async def solve_aws_token_async(siteurl: str, req_id: str = "-",
                                  timeout: int = 45) -> dict:
     """Navigate to the target and poll for the `aws-waf-token` cookie that
     the AWS WAF challenge JS sets once it clears. Returns the cookie + UA."""
-    pool = await get_pool()
-    async with pool.sem:
-        async with pool.key_lock(siteurl):
-            for attempt in (1, 2):
-                page = None
-                try:
-                    _step(req_id, f"aws-waf -> {siteurl}")
-                    page = await pool.new_page(siteurl)
-                    loop = asyncio.get_event_loop()
-                    deadline = loop.time() + timeout
-                    token = None
-                    while loop.time() < deadline:
-                        cookies = await pool.browser.cookies()
-                        token = next((c for c in cookies
-                                      if c.get("name") == "aws-waf-token"), None)
-                        if token:
-                            break
-                        await asyncio.sleep(1)
-                    if not token:
-                        raise TimeoutError(f"aws-waf-token not set within {timeout}s")
-                    user_agent = await page.evaluate("navigator.userAgent")
-                    _step(req_id, "aws-waf-token obtained")
-                    return {
-                        "token": token.get("value"),
-                        "cookie": f"aws-waf-token={token.get('value')}",
-                        "user_agent": user_agent,
-                        "url": page.url,
-                    }
-                except Exception as exc:
-                    if attempt == 1 and _is_dead_browser_error(exc):
-                        _step(req_id, f"browser dead, relaunching: {exc}")
-                        await pool.shutdown()
-                        continue
-                    raise
-                finally:
-                    pool.solve_count += 1
-                    if page is not None:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-            raise RuntimeError("solve_aws_token_async: unreachable")
+    _step(req_id, f"aws-waf -> {siteurl}")
+
+    async def run(page, pool):
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        token = None
+        while loop.time() < deadline:
+            # Scoped to the page URL: the profile is shared, so an unscoped
+            # cookies() call would return a stale token from another site.
+            cookies = await pool.browser.cookies(page.url or siteurl)
+            token = next((c for c in cookies
+                          if c.get("name") == "aws-waf-token"), None)
+            if token:
+                break
+            await asyncio.sleep(1)
+        if not token:
+            raise TimeoutError(f"aws-waf-token not set within {timeout}s")
+        user_agent = await page.evaluate("navigator.userAgent")
+        _step(req_id, "aws-waf-token obtained")
+        return {
+            "token": token.get("value"),
+            "cookie": f"aws-waf-token={token.get('value')}",
+            "user_agent": user_agent,
+            "url": page.url,
+        }
+
+    return await _run_in_tab(siteurl, siteurl, req_id, run)
 
 
 def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:

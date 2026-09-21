@@ -1,343 +1,192 @@
 # Violetics Solver
 
-Local HTTP service that solves Cloudflare Turnstile widgets and clears
-Cloudflare "Just a moment..." JS / interactive challenges. Built on
-[Pydoll](https://github.com/autoscrape-labs/pydoll) (CDP-direct Chromium
-automation) for the Turnstile widget path and
-[Byparr](https://github.com/ThePhaseless/Byparr)
-(Camoufox + playwright-captcha) for the JS-challenge path, behind a single
-unified HTTP API.
+HTTP service that solves Cloudflare Turnstile, clears Cloudflare JS /
+interactive challenges, mints reCAPTCHA v3 tokens and fetches AWS WAF tokens.
 
-## Features
-
-- `POST /solve` — solves a Turnstile widget and returns the token. Uses a
-  warm Pydoll Chromium instance with a persistent user-data-dir. Uses
-  Pydoll's built-in `expect_and_bypass_cloudflare_captcha` shadow-root
-  detection + click for the actual interaction.
-- `POST /solve-challenge` — clears a Cloudflare JS or interactive challenge
-  and returns the final URL, title, cookies (filtered to the target
-  domain), user-agent, and full HTML. Delegates to a bundled Byparr
-  instance (FlareSolverr-compatible protocol); falls back to the
-  in-process Pydoll path if the proxy is unreachable.
-- Browser is **warmed at startup** so the first request doesn't pay a
-  cold-start penalty.
-- Sanitised error responses with stable `error_code` field — internal
-  Playwright/Camoufox stack traces stay in the server log only.
-- Bounded request body (default 64 KB) and `siteurl` validation
-  (http/https only) to prevent the headless browser from being pointed at
-  attacker-controlled `file://` / `chrome://` URLs.
-- Structured single-block log per request with per-step progress output.
-- Async HTTP server (aiohttp); clients may send requests in parallel,
-  solves are serialised internally to avoid CF difficulty escalation.
-- `docker compose up -d` brings up both services with health-gated
-  startup.
-
-### Why Pydoll + Byparr?
-
-Pydoll talks CDP directly over a WebSocket — no WebDriver, no
-Playwright Node driver, no `navigator.webdriver` flag. That means the
-driver-side bug class that killed the previous Camoufox+Playwright
-stack on real Cloudflare pages (`pageError.location.url` crash) can't
-reach us. Pydoll also ships a built-in Cloudflare Turnstile bypass
-(shadow-root inspection + click) which we wire into every `/solve`.
-
-For the heavier JS-challenge path, Byparr ships its own Camoufox-based
-worker that actively tracks CF protocol changes; it clears those pages
-in 10–20 s on a cold profile. Byparr exposes a FlareSolverr-compatible
-API (`POST /v1` with `cmd: request.get`), so swapping to FlareSolverr
-later is one env var.
-
-#### Sitekey domain binding
-
-Cloudflare binds most production Turnstile sitekeys to the origin they
-were issued for. `/solve` therefore navigates to the real `siteurl`
-and uses the widget rendered there. If the page doesn't render the
-requested sitekey, we return an error rather than forging a fake host
-page — a forged origin won't yield a valid token anyway. Pass the URL
-that actually hosts the sitekey.
-
-## Requirements
-
-- Docker and Docker Compose, **or**
-- Python 3.11+ (tested on 3.13) and a Chromium binary
-  (`/usr/bin/chromium` or pointed via `CHROME_PATH`).
+- Browser: [Camoufox](https://github.com/daijro/camoufox) (stealth Firefox),
+  headed under Xvfb, one warm instance with a persistent profile.
+- JS challenges are delegated to [Byparr](https://github.com/ThePhaseless/Byparr)
+  when configured; Camoufox is the fallback.
+- Egress through Cloudflare WARP (HTTP proxy) in the compose stack.
 
 ## Quick start
 
 ```bash
 git clone git@github.com:cv3inx/turnstile-solver.git
 cd turnstile-solver
+cp .env.example .env      # set API_KEY before exposing it
 docker compose up -d
+curl http://127.0.0.1:9988/health
 ```
 
-This starts two containers:
+Containers: `violetics-solver` (bound to `127.0.0.1:9988`), `violetics-byparr`
+and `violetics-warp` (internal network only). The solver starts after WARP and
+Byparr report healthy. Playground UI at `http://127.0.0.1:9988/`
+(append `?api_key=...` when `API_KEY` is set).
 
-- `violetics-solver` (this service) on `:9988`
-- `violetics-byparr` (Camoufox-based CF challenge worker) on the internal
-  compose network only — not exposed on the host.
-
-The solver waits for Byparr to report healthy before starting.
-
-Check it:
+Without Docker:
 
 ```bash
-curl http://localhost:9988/health
-```
-
-### Disabling the Byparr delegation
-
-Remove the `byparr` service and the `CHALLENGE_PROXY_URL` env from
-`docker-compose.yml`, or set `CHALLENGE_PROXY_URL=""`. `/solve-challenge`
-will then run the pure-Pydoll path. Expect higher latency and more
-timeouts on hosts where Cloudflare's interactive challenge page resists
-headless Chromium.
-
-### Plain Docker
-
-```bash
-docker build -t violetics-solver .
-docker run -d --name byparr --restart unless-stopped \
-  ghcr.io/thephaseless/byparr:latest
-docker run -d --name solver --shm-size=1gb \
-  --link byparr \
-  -e CHALLENGE_PROXY_URL=http://byparr:8191 \
-  -e CHALLENGE_PROXY_KIND=byparr \
-  -p 9988:9988 \
-  -v solver-profile:/tmp/ts_profile \
-  violetics-solver
-```
-
-`--shm-size=1gb` is required — Firefox crashes with the default 64 MB
-`/dev/shm`. The volume mount preserves the Cloudflare cookie profile
-across container restarts.
-
-### Host install (optional)
-
-```bash
-sudo apt install chromium  # or set CHROME_PATH to your binary
-pip install -r requirements.txt
-# Byparr is optional; without it /solve-challenge runs the in-process
-# Pydoll path only.
-export CHALLENGE_PROXY_URL=http://localhost:8191   # if running Byparr locally
-export CHALLENGE_PROXY_KIND=byparr
+sudo apt install xvfb
+pip install -r requirements.txt && python -m camoufox fetch
 python -m app
 ```
 
 ## Configuration
 
-Environment variables:
+All values are environment variables. Defaults in `.env.example`.
 
-| Variable                | Default           | Description                                                                                       |
-|-------------------------|-------------------|---------------------------------------------------------------------------------------------------|
-| `PORT`                  | `9988`            | HTTP port                                                                                         |
-| `MAX_WORKERS`           | `8`               | Max concurrent in-flight HTTP requests (solves are serialised internally)                         |
-| `MAX_BODY_BYTES`        | `65536`           | Max accepted request body size                                                                    |
-| `LOG_LEVEL`             | `INFO`            | Python logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                                        |
-| `API_KEY`               | _(unset)_         | When set, every path except `/health` requires it via `X-API-Key` header or `?api_key=`. Empty = auth off. |
-| `CHALLENGE_PROXY_URL`   | _(unset)_         | Base URL of a Byparr/FlareSolverr instance. When set, `/solve-challenge` delegates to it.         |
-| `CHALLENGE_PROXY_KIND`  | `byparr`          | `byparr` (timeouts in seconds) or `flaresolverr` (timeouts in ms). Auto-set when only `FLARESOLVERR_URL` is provided. |
-| `FLARESOLVERR_URL`      | _(unset)_         | Back-compat alias for `CHALLENGE_PROXY_URL` with `KIND=flaresolverr`                              |
-| `TS_PROFILE_DIR`        | `/tmp/ts_profile` | Persistent Chromium user-data-dir                                                                 |
-| `HEADLESS`              | `true`            | `true` runs Chromium with `--headless=new`. `false` opts into headed mode (Xvfb at `:99`).        |
-| `CHROME_PATH`           | `/usr/bin/chromium` | Path to the Chromium binary (overridable for headed/Chrome-stable runs).                        |
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `9988` | HTTP port |
+| `MAX_WORKERS` | `8` | Max concurrent browser tabs. Same sitekey is serialised; different sitekeys run in parallel. |
+| `MAX_BODY_BYTES` | `65536` | Max request body |
+| `LOG_LEVEL` | `INFO` | `DEBUG` adds per-step solve progress |
+| `API_KEY` | unset | When set, every path except `/health` needs it via `X-API-Key` header or `?api_key=`. |
+| `RATE_LIMIT_PER_MIN` | `10` | Admitted solve requests per minute per client IP. Exceeding it bans the IP. `0` = off. |
+| `MAX_CONCURRENT_PER_IP` | `5` | In-flight solves per client IP. `0` = off. |
+| `BAN_SECONDS` | `86400` | Ban length. Bans persist in SQLite. |
+| `DB_PATH` | `/data/solver.db` | SQLite file for bans and counters |
+| `ALLOW_PRIVATE_TARGETS` | unset | `1` allows `siteurl` on loopback / private / link-local hosts (dev only). |
+| `SOLVER_PROXY` | unset | Outbound HTTP proxy for the browser and Byparr, e.g. `http://warp:8080` |
+| `CHALLENGE_PROXY_URL` | unset | Byparr / FlareSolverr base URL. When set, `/solve-challenge` delegates to it. |
+| `CHALLENGE_PROXY_KIND` | `byparr` | `byparr` (timeouts in s) or `flaresolverr` (timeouts in ms) |
+| `TS_PROFILE_DIR` | `/tmp/ts_profile` | Persistent Camoufox profile |
+| `HEADLESS` | `false` | `false` = headed under Xvfb. `true` = headless; real CF widgets usually refuse to mount. |
 
-## API
+## API reference
 
-All endpoints accept and return JSON.
+All endpoints take and return JSON. Send `X-API-Key: <key>` when `API_KEY` is set.
 
-### `POST /solve`
+Common request fields:
 
-Solves a Turnstile widget.
+| Field | Type | Notes |
+|---|---|---|
+| `siteurl` | string | Required. `http`/`https`, public host. |
+| `sitekey` | string | Required on `/solve`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
+| `timeout` | int | Seconds, clamped to `5..180`, default `45`. Covers the whole request including queueing. Server aborts at `timeout + 15` s. Set your HTTP client timeout above that. |
 
-Request:
-
-```json
-{
-  "sitekey": "0x4AAAAAAC3x1HiBz5IFyj7s",
-  "siteurl": "https://www.example.com/",
-  "timeout": 45,
-  "action": "login",
-  "cdata": "optional-customer-data"
-}
-```
-
-`action` and `cdata` are optional and forwarded to the widget when present.
-`timeout` is clamped to `[5, 180]` seconds; default `45`.
-
-Response (200):
+Every response carries `elapsed` (seconds). Errors:
 
 ```json
-{
-  "token": "1.abc...xyz",
-  "elapsed": 6.14
-}
+{ "error": "solve timeout", "error_code": "timeout", "elapsed": 45.2 }
 ```
 
-Response (4xx / 5xx):
+| `error_code` | HTTP | Meaning |
+|---|---|---|
+| `bad_request` | 400 | Invalid JSON, missing or malformed field, disallowed `siteurl` |
+| `unauthorized` | 401 | `API_KEY` set and missing or wrong |
+| `banned` | 429 | IP exceeded `RATE_LIMIT_PER_MIN`. `retry_after` in seconds. |
+| `too_many_concurrent` | 429 | IP at `MAX_CONCURRENT_PER_IP` in-flight solves |
+| `browser_error` | 503 | Browser closed or navigation failed. Retry. |
+| `timeout` | 504 | Not solved within `timeout` |
+| `solver_error` | 500 | Internal failure. Detail in server log only. |
+
+### `POST /solve` — Turnstile token
 
 ```json
-{
-  "error": "solve timeout",
-  "error_code": "timeout",
-  "elapsed": 45.2
-}
+{ "sitekey": "0x4AAAAAAC3x1HiBz5IFyj7s", "siteurl": "https://www.example.com/",
+  "timeout": 45, "action": "login", "cdata": "optional" }
 ```
 
-`error_code` is one of:
-
-| Code            | HTTP | Meaning                                                  |
-|-----------------|------|----------------------------------------------------------|
-| `bad_request`   | 400  | Validation failure (missing field, bad URL, oversize)    |
-| `timeout`       | 504  | Solve did not finish within `timeout` seconds            |
-| `browser_error` | 503  | Browser closed / navigation failure — caller should retry |
-| `solver_error`  | 500  | Internal failure (sanitised — see server log for detail) |
-
-### `POST /solve-challenge`
-
-Clears a Cloudflare JS or interactive challenge and returns the page state.
-When `CHALLENGE_PROXY_URL` is configured, the request is proxied to Byparr
-transparently — callers see the same response shape either way.
-
-Request:
+`action`, `cdata`: optional, `[A-Za-z0-9_-]{1,255}`. The widget is rendered on
+a host page served under the `siteurl` origin (route interception; the real
+site is never fetched), so pass the URL the sitekey is bound to.
 
 ```json
-{
-  "siteurl": "https://api.example.com/docs",
-  "timeout": 45
-}
+{ "token": "1.abc...xyz", "elapsed": 6.14 }
 ```
 
-Response (200):
+### `POST /solve-challenge` — clear "Just a moment..."
+
+```json
+{ "siteurl": "https://api.example.com/docs", "timeout": 45 }
+```
 
 ```json
 {
   "url": "https://api.example.com/docs/",
   "title": "Example API",
   "user_agent": "Mozilla/5.0 ...",
-  "cookies": [
-    {
-      "name": "cf_clearance",
-      "value": "...",
-      "domain": ".example.com",
-      "path": "/",
-      "expires": 1811226000
-    }
-  ],
+  "cookies": [ { "name": "cf_clearance", "value": "...", "domain": ".example.com",
+                 "path": "/", "expires": 1811226000 } ],
   "html": "<!doctype html>...",
   "elapsed": 15.52
 }
 ```
 
-Use the returned `cf_clearance` cookie together with `user_agent` when
-proxying the protected API. Both must match — Cloudflare rejects the
-cookie if the user-agent differs from the one that earned it.
+Reuse `cf_clearance` together with `user_agent`; Cloudflare rejects the cookie
+under a different UA. Extensionless paths are retried with a trailing slash.
 
-The solver auto-retries extensionless paths with a trailing slash, since
-Byparr/FlareSolverr is sensitive to that for some sites (e.g. `/docs`
-times out, but `/docs/` clears).
-
-### `GET /health`
-
-Returns service status counters.
+### `POST /recaptcha-v3` — reCAPTCHA v3 token
 
 ```json
-{
-  "status": "ok",
-  "mode": "byparr",
-  "proxy_url": "http://byparr:8191",
-  "in_flight": 0,
-  "solved": 30,
-  "errors": 1,
-  "challenges": 11
-}
+{ "sitekey": "6Lc...", "siteurl": "https://www.example.com/", "action": "verify", "timeout": 45 }
 ```
+
+`action`: optional, `[A-Za-z0-9_/]{1,64}`, default `verify`.
+
+```json
+{ "token": "03AFcWeA...", "elapsed": 4.02 }
+```
+
+### `POST /aws-token` — AWS WAF token
+
+```json
+{ "siteurl": "https://www.example.com/", "timeout": 45 }
+```
+
+```json
+{ "token": "...", "cookie": "aws-waf-token=...", "user_agent": "Mozilla/5.0 ...",
+  "url": "https://www.example.com/", "elapsed": 5.31 }
+```
+
+### `GET /health` — no auth
+
+```json
+{ "status": "ok", "warp": "on", "mode": "byparr", "proxy_url": "http://byparr:8191",
+  "in_flight": 0, "solved": 30, "errors": 1, "challenges": 11 }
+```
+
+`mode` is `camoufox` when no challenge proxy is configured. `warp` is
+`on` / `off` / `unknown`, refreshed every 30 s.
 
 ### `GET /stats`
 
-Returns extended counters: uptime, total requests, success rate, latency
-percentiles (avg / p50 / p95), and the last 50 request events. Used by
-the built-in playground at `/`.
+Counters, uptime, success rate, latency (`avg`, `p50`, `p95` in ms) and the
+last 50 request events. Used by the playground.
 
-## Log format
+## Logging
 
-Each request produces one block with real-time progress steps:
-
-```
-「 NEW REQUEST 」
-» ID     : 29241879
-» FROM   : 172.20.0.1
-» POST   : /solve
-» URL    : https://www.example.com/
-» KEY    : 0x4AAAAAAC3x1H...
-  [29241879] opening tab for https://www.example.com/
-  [29241879] route intercepted https://www.example.com/
-  [29241879] token obtained (4.3s)
-» SPEED  : 4.31s
-» STATUS : 200 - token 1.1Tqrqdr...26cb55 (538 chars)
-```
-
-For JS-challenge requests routed through Byparr:
+One line per request on stdout:
 
 ```
-「 NEW REQUEST 」
-» ID     : cdd14513
-» FROM   : 172.20.0.1
-» POST   : /solve-challenge
-» URL    : https://api.example.com/docs
-  [cdd14513] delegating to byparr -> http://byparr:8191
-  [cdd14513] byparr cleared (15.5s, cookies=1)
-» SPEED  : 15.52s
-» STATUS : 200 - title='Example API' cookies=1 html=74236b
+✓ 1a2b3c4d turnstile  200   3.21s  1.2.3.4  https://www.example.com/ key=0x4AAAAAAA…  → token 1.1Tqrqdr...26cb55 (538 chars)
+✗ cdd14513 challenge  504  45.10s  1.2.3.4  https://api.example.com/docs  → error: solve timeout
 ```
 
-All output is written to stdout. Internal library warnings are suppressed.
-
-## Concurrency
-
-The service accepts many HTTP requests in parallel, but Cloudflare
-escalates difficulty when multiple tabs on the same profile request a
-token for the same sitekey at once. Solves are therefore serialised
-inside the service.
-
-Typical throughput on a warm browser:
-
-- Turnstile (`/solve`), always-pass demo: 4–8 s end-to-end
-- Turnstile (`/solve`), real sitekey: depends entirely on the target
-  page; the solver itself adds ~2 s on top of CF's own clearance time
-- JS challenge via Byparr: ~15 s per solve (single Byparr worker)
-- JS challenge via in-process Pydoll, warm profile: 2–5 s
-
-Scaling beyond single-browser throughput requires multiple independent
-solver instances, each with its own warm profile and IP.
+Failed solves log the full trace server-side; clients get the sanitised
+`error_code` only. `LOG_LEVEL=DEBUG` adds per-step progress.
 
 ## Production notes
 
-This service is intended to run inside a trusted network. Before exposing
-it publicly:
+- Set `API_KEY`. Without it solve endpoints and `/stats` are open to anyone
+  reaching the port.
+- Keep the port on loopback (compose default) behind a reverse proxy for TLS.
+  `X-Forwarded-For` is trusted only when the direct peer is a private or
+  loopback address.
+- `--shm-size=1gb` is required; Firefox crashes on the default 64 MB `/dev/shm`.
+- `/tmp/ts_profile` holds Cloudflare cookies. Treat the volume as sensitive.
+- `playwright` is pinned to 1.54.0; newer drivers crash on real Cloudflare pages.
 
-- Put it behind a reverse proxy (Caddy / nginx) for TLS, CORS, and IP
-  allow-listing.
-- Add an auth layer at the proxy — every `/solve` is a real browser tab
-  and is expensive, so unauthenticated public access is an abuse vector.
-- Add a per-IP rate limit at the proxy.
-
-The persistent profile volume (`/tmp/ts_profile`) holds Cloudflare
-cookies. Treat it as sensitive — anyone with the volume can reuse those
-clearances.
-
-## File layout
+## Layout
 
 ```
-app/                 Python package (run with `python -m app`)
-  __main__.py        Entry point
-  service.py         aiohttp HTTP wrapper, auth, request logging, validation
-  solver.py          Core browser automation (Camoufox) + Byparr delegation
-requirements.txt     Python dependencies (camoufox, playwright, aiohttp)
-Dockerfile           Container image (Python + Camoufox/Firefox + Xvfb)
-docker-compose.yml   Compose stack: warp + solver + byparr
-entrypoint.sh        Container entrypoint (Xvfb fallback, starts service)
-web/                 Built-in playground UI
-.env.example         Documented environment variables
+app/service.py       aiohttp HTTP layer: auth, rate limit, validation, logging
+app/solver.py        Camoufox automation + Byparr delegation
+app/db.py            SQLite persistence (bans, counters)
+web/templates/       Playground UI
+docker-compose.yml   warp + solver + byparr
 ```
 
 ## License

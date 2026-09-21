@@ -4,9 +4,13 @@ Violetics Solver - Turnstile + CF JS-Challenge HTTP service (aiohttp).
 
 import asyncio
 import collections
+import hmac
+import ipaddress
 import json
 import logging
 import os
+import re
+import socket
 import sys
 import time
 import uuid
@@ -32,6 +36,9 @@ RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", 10))   # requests/
 MAX_CONCURRENT_PER_IP = int(os.environ.get("MAX_CONCURRENT_PER_IP", 5))  # in-flight/IP
 # Exceeding the rate limit bans the IP for this long (seconds; default 1 day).
 BAN_SECONDS = int(os.environ.get("BAN_SECONDS", 86400))
+# Dev escape hatch: let siteurl point at loopback / private / link-local
+# addresses (blocked by default to stop SSRF into the docker network).
+ALLOW_PRIVATE_TARGETS = os.environ.get("ALLOW_PRIVATE_TARGETS", "").lower() in ("1", "true", "yes")
 
 log = logging.getLogger("service")
 
@@ -44,6 +51,8 @@ _PROCESS_STARTED = time.time()
 
 
 _stats = {"in_flight": 0, "solved": 0, "errors": 0, "challenges": 0}
+# Only these survive a restart; in_flight is live state.
+_PERSISTED_STATS = ("solved", "errors", "challenges")
 
 # Recent events for the playground's live stats panel. Capped ring buffer so
 # an idle process does not accumulate memory. Each entry: {ts, endpoint,
@@ -64,7 +73,8 @@ def _classify_error(exc: BaseException) -> tuple[str, str, int]:
     """
     msg = str(exc).strip()
     low = msg.lower()
-    if isinstance(exc, TimeoutError) or "timeout" in low:
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timeout" in low \
+            or "did not respond within" in low:
         # Don't leak Playwright stack text (e.g. "Page.evaluate: ...") — the
         # full detail still goes to the server log via log.exception.
         return "timeout", "solve timeout", 504
@@ -151,23 +161,77 @@ def _emit_end(rid: str, elapsed: float, status: int, body: dict):
           flush=True)
 
 
-def _validate_siteurl(siteurl: str) -> None:
-    """Cheap guard against empty / non-http(s) / no-host URLs.
+# ---------- Input validation (trust boundary) ----------
 
-    Defends the headless browser against attacker-controlled `file://` or
-    `chrome://` URLs and gives callers a clean 400 instead of a downstream
-    Playwright error.
-    """
+# Turnstile keys look like 0x4AAAAAAA..., reCAPTCHA keys like 6Lc...; both are
+# URL-safe base64-ish. Also what ends up in a data-* attribute of the host
+# page, so keep it tight.
+_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Turnstile action / cdata: alphanumeric, _ and -, <=255 chars (CF's own rule).
+_ATTR_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+# reCAPTCHA v3 action: alphanumeric, slash, underscore.
+_RC_ACTION_RE = re.compile(r"^[A-Za-z0-9_/]{1,64}$")
+
+
+def _field(payload: dict, name: str, pattern: "re.Pattern", required: bool = False) -> str:
+    v = payload.get(name)
+    if v is None or v == "":
+        if required:
+            raise ValueError(f"{name} required")
+        return ""
+    if not isinstance(v, str):
+        raise ValueError(f"{name} must be a string")
+    v = v.strip()
+    if not pattern.match(v):
+        raise ValueError(f"invalid {name}")
+    return v
+
+
+def _timeout(payload: dict) -> int:
+    try:
+        return max(5, min(180, int(payload.get("timeout", 45))))
+    except (TypeError, ValueError):
+        return 45
+
+
+def _is_private_ip(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+async def _validate_siteurl(siteurl: str) -> None:
+    """Guard against empty / non-http(s) / no-host URLs, and against targets
+    that resolve into loopback / private / link-local space (SSRF into the
+    docker network via the headless browser or Byparr)."""
     if not siteurl:
         raise ValueError("siteurl required")
+    if len(siteurl) > 2048:
+        raise ValueError("siteurl too long")
     try:
         u = urlparse(siteurl)
     except Exception:
         raise ValueError("invalid siteurl")
     if u.scheme not in ("http", "https"):
         raise ValueError("siteurl scheme must be http or https")
-    if not u.hostname:
+    host = u.hostname
+    if not host:
         raise ValueError("siteurl missing host")
+    if ALLOW_PRIVATE_TARGETS:
+        return
+    if host == "localhost" or host.endswith(".localhost") or _is_private_ip(host):
+        raise ValueError("siteurl host not allowed")
+    try:
+        infos = await asyncio.get_event_loop().getaddrinfo(
+            host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise ValueError("siteurl host does not resolve")
+    for info in infos:
+        if _is_private_ip(info[4][0]):
+            raise ValueError("siteurl host not allowed")
 
 
 # Paths reachable without a key even when API_KEY is set. /health stays open
@@ -182,7 +246,7 @@ async def auth_middleware(request: web.Request, handler):
     so the browser playground can pass it in the URL."""
     if API_KEY and request.path not in _PUBLIC_PATHS:
         given = request.headers.get("X-API-Key") or request.query.get("api_key") or ""
-        if given != API_KEY:
+        if not hmac.compare_digest(given.encode(), API_KEY.encode()):
             return web.json_response(
                 {"error": "unauthorized", "error_code": "unauthorized"}, status=401)
     return await handler(request)
@@ -214,12 +278,15 @@ def _kill_ip_tasks(ip: str) -> int:
 
 
 def _client_ip(request: web.Request) -> str:
-    """Real client IP. Trust the first X-Forwarded-For hop since the service
-    runs behind a reverse proxy (cf.vltcx.eu.cc)."""
+    """Real client IP. X-Forwarded-For is only honoured when the direct peer
+    is a private/loopback address (our reverse proxy or docker network); a
+    public peer hitting the port directly could otherwise spoof it to dodge
+    bans or ban someone else."""
+    remote = request.remote or "-"
     xff = request.headers.get("X-Forwarded-For")
-    if xff:
-        return xff.split(",")[0].strip()
-    return request.remote or "-"
+    if xff and _is_private_ip(remote):
+        return xff.split(",")[0].strip() or remote
+    return remote
 
 
 @web.middleware
@@ -255,7 +322,7 @@ async def ratelimit_middleware(request: web.Request, handler):
             until = now + BAN_SECONDS
             _ip_banned[ip] = until
             db.save_ban(ip, until)
-            hits.clear()
+            _ip_hits.pop(ip, None)
             killed = _kill_ip_tasks(ip)
             log.warning("banned ip=%s for %ds (>%d req/min), killed %d in-flight",
                         ip, BAN_SECONDS, RATE_LIMIT_PER_MIN, killed)
@@ -263,13 +330,17 @@ async def ratelimit_middleware(request: web.Request, handler):
                 {"error": "temporarily banned for abuse", "error_code": "banned",
                  "retry_after": BAN_SECONDS},
                 status=429, headers={"Retry-After": str(BAN_SECONDS)})
-        hits.append(now)
 
     if MAX_CONCURRENT_PER_IP > 0 and _ip_inflight[ip] >= MAX_CONCURRENT_PER_IP:
         log.warning("concurrency cap hit ip=%s (%d)", ip, MAX_CONCURRENT_PER_IP)
         return web.json_response(
             {"error": "too many concurrent requests", "error_code": "too_many_concurrent"},
             status=429)
+
+    # Count only admitted requests, so a client backing off after a
+    # too_many_concurrent 429 is not marched into a day-long ban.
+    if RATE_LIMIT_PER_MIN > 0:
+        _ip_hits[ip].append(now)
 
     _ip_inflight[ip] += 1
     # Run the handler as a tracked task so a mid-flight ban can cancel it.
@@ -295,246 +366,131 @@ async def ratelimit_middleware(request: web.Request, handler):
 
 
 async def _read_payload(request: web.Request) -> dict:
-    """Bounded-size JSON body parse. Raises ValueError on bad input."""
-    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+    """Bounded-size JSON object body. Raises ValueError on bad input.
+    aiohttp enforces client_max_size (=MAX_BODY_BYTES) inside read()."""
+    try:
+        raw = await request.read()
+    except web.HTTPRequestEntityTooLarge:
         raise ValueError("request body too large")
-    raw = await request.content.read(MAX_BODY_BYTES + 1)
     if len(raw) > MAX_BODY_BYTES:
         raise ValueError("request body too large")
     try:
-        return json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except Exception:
         raise ValueError("invalid JSON")
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be an object")
+    return payload
+
+
+# ---------- Solve endpoints ----------
+# Each endpoint parses its payload into (siteurl, key, coroutine factory); the
+# shared _handle() does validation, stats, logging, timeout and error mapping.
+
+def _parse_solve(p: dict):
+    sitekey = _field(p, "sitekey", _KEY_RE, required=True)
+    siteurl = (p.get("siteurl") or "")
+    action = _field(p, "action", _ATTR_RE) or None
+    cdata = _field(p, "cdata", _ATTR_RE) or None
+
+    def run(rid, timeout):
+        return solve_async(sitekey, siteurl, req_id=rid, timeout=timeout,
+                           action=action, cdata=cdata)
+    return siteurl, sitekey, run
+
+
+def _parse_challenge(p: dict):
+    siteurl = (p.get("siteurl") or "")
+
+    def run(rid, timeout):
+        return solve_challenge_async(siteurl, req_id=rid, timeout=timeout)
+    return siteurl, "", run
+
+
+def _parse_recaptcha(p: dict):
+    sitekey = _field(p, "sitekey", _KEY_RE, required=True)
+    siteurl = (p.get("siteurl") or "")
+    action = _field(p, "action", _RC_ACTION_RE) or "verify"
+
+    def run(rid, timeout):
+        return solve_recaptcha_v3_async(sitekey, siteurl, req_id=rid,
+                                        timeout=timeout, action=action)
+    return siteurl, sitekey, run
+
+
+def _parse_aws(p: dict):
+    siteurl = (p.get("siteurl") or "")
+
+    def run(rid, timeout):
+        return solve_aws_token_async(siteurl, req_id=rid, timeout=timeout)
+    return siteurl, "", run
+
+
+# path -> (stats counter bumped on success, payload parser)
+_ENDPOINTS = {
+    "/solve": ("solved", _parse_solve),
+    "/solve-challenge": ("challenges", _parse_challenge),
+    "/recaptcha-v3": ("solved", _parse_recaptcha),
+    "/aws-token": ("challenges", _parse_aws),
+}
 
 
 async def handle_solve(request: web.Request) -> web.Response:
     rid = _rid()
     t0 = time.time()
     path = request.path
-    method = request.method
-    peer = request.remote or "-"
+    peer = _client_ip(request)
+    counter, parse = _ENDPOINTS[path]
+    siteurl = ""
+
+    def fail(status: int, body: dict) -> web.Response:
+        elapsed = time.time() - t0
+        _emit_end(rid, elapsed, status, body)
+        _record_event(path, status, elapsed, siteurl, body)
+        return web.json_response(body, status=status)
 
     try:
         payload = await _read_payload(request)
+        siteurl_raw = payload.get("siteurl")
+        if siteurl_raw is not None and not isinstance(siteurl_raw, str):
+            raise ValueError("siteurl must be a string")
+        payload["siteurl"] = (siteurl_raw or "").strip()
+        siteurl, key, run = parse(payload)
+        _emit_start(rid, request.method, path, siteurl, key, peer)
+        await _validate_siteurl(siteurl)
     except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_start(rid, method, path, "", "", peer)
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, "", body)
-        return web.json_response(body, status=400)
+        if rid not in _req_ctx:
+            _emit_start(rid, request.method, path, siteurl, "", peer)
+        return fail(400, {"error": str(ve), "error_code": "bad_request"})
 
-    sitekey = (payload.get("sitekey") or "").strip()
-    siteurl = (payload.get("siteurl") or "").strip()
-    try:
-        timeout = max(5, min(180, int(payload.get("timeout", 45))))
-    except (TypeError, ValueError):
-        timeout = 45
-    action = payload.get("action") or None
-    cdata = payload.get("cdata") or None
-
-    _emit_start(rid, method, path, siteurl, sitekey, peer)
-
-    if not sitekey:
-        body = {"error": "sitekey required", "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-    try:
-        _validate_siteurl(siteurl)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-
+    timeout = _timeout(payload)
     _stats["in_flight"] += 1
     try:
-        token = await solve_async(sitekey, siteurl, req_id=rid, timeout=timeout,
-                                   action=action, cdata=cdata)
+        # Hard wall-clock cap on the whole solve, including queueing behind
+        # the per-key lock / semaphore and the initial navigation. Without it
+        # the client gives up while the server keeps a worker slot busy.
+        result = await asyncio.wait_for(run(rid, timeout), timeout + 15)
         elapsed = time.time() - t0
-        _stats["solved"] += 1
-        body = {"token": token, "elapsed": round(elapsed, 2)}
+        _stats[counter] += 1
+        body = result if isinstance(result, dict) else {"token": result}
+        body = {**body, "elapsed": round(elapsed, 2)}
         _emit_end(rid, elapsed, 200, body)
         _record_event(path, 200, elapsed, siteurl, body)
         return web.json_response(body)
+    except asyncio.CancelledError:
+        # Killed by a ban (or the connection went away). Close out the log
+        # line so _req_ctx doesn't leak, then let the middleware answer.
+        _stats["errors"] += 1
+        fail(499, {"error": "cancelled", "error_code": "cancelled"})
+        raise
     except Exception as exc:
         elapsed = time.time() - t0
         _stats["errors"] += 1
         code, public_msg, status = _classify_error(exc)
         # Full detail to the server log; sanitised body to the client.
-        log.exception("solve failed rid=%s code=%s", rid, code)
-        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, status, body)
-        _record_event(path, status, elapsed, siteurl, body)
-        return web.json_response(body, status=status)
-    finally:
-        _stats["in_flight"] -= 1
-
-
-async def handle_challenge(request: web.Request) -> web.Response:
-    rid = _rid()
-    t0 = time.time()
-    path = request.path
-    method = request.method
-    peer = request.remote or "-"
-
-    try:
-        payload = await _read_payload(request)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_start(rid, method, path, "", "", peer)
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, "", body)
-        return web.json_response(body, status=400)
-
-    siteurl = (payload.get("siteurl") or "").strip()
-    try:
-        timeout = max(5, min(180, int(payload.get("timeout", 45))))
-    except (TypeError, ValueError):
-        timeout = 45
-
-    _emit_start(rid, method, path, siteurl, "", peer)
-
-    try:
-        _validate_siteurl(siteurl)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-
-    _stats["in_flight"] += 1
-    try:
-        result = await solve_challenge_async(siteurl, req_id=rid, timeout=timeout)
-        elapsed = time.time() - t0
-        _stats["challenges"] += 1
-        body = {**result, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, 200, body)
-        _record_event(path, 200, elapsed, siteurl, body)
-        return web.json_response(body)
-    except Exception as exc:
-        elapsed = time.time() - t0
-        _stats["errors"] += 1
-        code, public_msg, status = _classify_error(exc)
-        log.exception("challenge failed rid=%s code=%s", rid, code)
-        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, status, body)
-        _record_event(path, status, elapsed, siteurl, body)
-        return web.json_response(body, status=status)
-    finally:
-        _stats["in_flight"] -= 1
-
-
-async def handle_recaptcha(request: web.Request) -> web.Response:
-    rid = _rid()
-    t0 = time.time()
-    path = request.path
-    peer = request.remote or "-"
-
-    try:
-        payload = await _read_payload(request)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_start(rid, request.method, path, "", "", peer)
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, "", body)
-        return web.json_response(body, status=400)
-
-    sitekey = (payload.get("sitekey") or "").strip()
-    siteurl = (payload.get("siteurl") or "").strip()
-    action = (payload.get("action") or "verify").strip()
-    try:
-        timeout = max(5, min(180, int(payload.get("timeout", 45))))
-    except (TypeError, ValueError):
-        timeout = 45
-
-    _emit_start(rid, request.method, path, siteurl, sitekey, peer)
-
-    if not sitekey:
-        body = {"error": "sitekey required", "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-    try:
-        _validate_siteurl(siteurl)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-
-    _stats["in_flight"] += 1
-    try:
-        token = await solve_recaptcha_v3_async(sitekey, siteurl, req_id=rid,
-                                               timeout=timeout, action=action)
-        elapsed = time.time() - t0
-        _stats["solved"] += 1
-        body = {"token": token, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, 200, body)
-        _record_event(path, 200, elapsed, siteurl, body)
-        return web.json_response(body)
-    except Exception as exc:
-        elapsed = time.time() - t0
-        _stats["errors"] += 1
-        code, public_msg, status = _classify_error(exc)
-        log.exception("recaptcha failed rid=%s code=%s", rid, code)
-        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, status, body)
-        _record_event(path, status, elapsed, siteurl, body)
-        return web.json_response(body, status=status)
-    finally:
-        _stats["in_flight"] -= 1
-
-
-async def handle_aws_token(request: web.Request) -> web.Response:
-    rid = _rid()
-    t0 = time.time()
-    path = request.path
-    peer = request.remote or "-"
-
-    try:
-        payload = await _read_payload(request)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_start(rid, request.method, path, "", "", peer)
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, "", body)
-        return web.json_response(body, status=400)
-
-    siteurl = (payload.get("siteurl") or "").strip()
-    try:
-        timeout = max(5, min(180, int(payload.get("timeout", 45))))
-    except (TypeError, ValueError):
-        timeout = 45
-
-    _emit_start(rid, request.method, path, siteurl, "", peer)
-
-    try:
-        _validate_siteurl(siteurl)
-    except ValueError as ve:
-        body = {"error": str(ve), "error_code": "bad_request"}
-        _emit_end(rid, time.time() - t0, 400, body)
-        _record_event(path, 400, time.time() - t0, siteurl, body)
-        return web.json_response(body, status=400)
-
-    _stats["in_flight"] += 1
-    try:
-        result = await solve_aws_token_async(siteurl, req_id=rid, timeout=timeout)
-        elapsed = time.time() - t0
-        _stats["challenges"] += 1
-        body = {**result, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, 200, body)
-        _record_event(path, 200, elapsed, siteurl, body)
-        return web.json_response(body)
-    except Exception as exc:
-        elapsed = time.time() - t0
-        _stats["errors"] += 1
-        code, public_msg, status = _classify_error(exc)
-        log.exception("aws-token failed rid=%s code=%s", rid, code)
-        body = {"error": public_msg, "error_code": code, "elapsed": round(elapsed, 2)}
-        _emit_end(rid, elapsed, status, body)
-        _record_event(path, status, elapsed, siteurl, body)
-        return web.json_response(body, status=status)
+        log.exception("%s failed rid=%s code=%s", _short_ep(path), rid, code)
+        return fail(status, {"error": public_msg, "error_code": code,
+                             "elapsed": round(elapsed, 2)})
     finally:
         _stats["in_flight"] -= 1
 
@@ -549,17 +505,17 @@ async def handle_playground(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html")
 
 
-_warp_cache = {"ts": 0.0, "state": "unknown"}
+_warp_state = "unknown"
 
 
-async def _warp_state() -> str:
+async def _refresh_warp_state() -> None:
     """warp=on/off from Cloudflare's trace endpoint, fetched through the same
-    egress proxy the browser uses so it reflects real solve traffic. Cached
-    30s so health polling doesn't hammer it. 'unknown' if the check fails."""
+    egress proxy the browser uses so it reflects real solve traffic. Runs in
+    the housekeeping loop, never on the /health request path, so a slow WARP
+    can't make the docker healthcheck time out."""
+    global _warp_state
     import aiohttp
     from .solver import _solver_proxy
-    if time.time() - _warp_cache["ts"] < 30:
-        return _warp_cache["state"]
     state = "unknown"
     try:
         timeout = aiohttp.ClientTimeout(total=4)
@@ -573,31 +529,19 @@ async def _warp_state() -> str:
                 break
     except Exception:
         state = "unknown"
-    _warp_cache.update(ts=time.time(), state=state)
-    return state
+    _warp_state = state
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    # Don't force-launch the browser from the healthcheck when a challenge
-    # proxy is configured - that caused restart loops previously.
-    warp = await _warp_state()
+    # Never launches or touches the browser: the healthcheck must stay cheap
+    # and independent of solver state (that caused restart loops previously).
     proxy_url, proxy_kind = _challenge_proxy()
+    body = {"status": "ok", "warp": _warp_state, **_stats}
     if proxy_url:
-        return web.json_response({
-            "status": "ok",
-            "mode": proxy_kind,
-            "proxy_url": proxy_url,
-            "warp": warp,
-            **_stats,
-        })
-    pool = await get_pool()
-    return web.json_response({
-        "status": "ok",
-        "max_concurrent": pool.max_concurrent,
-        "solved_total": pool.solve_count,
-        "warp": warp,
-        **_stats,
-    })
+        body.update(mode=proxy_kind, proxy_url=proxy_url)
+    else:
+        body.update(mode="camoufox", max_concurrent=MAX_WORKERS)
+    return web.json_response(body)
 
 
 async def handle_stats(request: web.Request) -> web.Response:
@@ -614,7 +558,7 @@ async def handle_stats(request: web.Request) -> web.Response:
     success_rate = round(((_stats["solved"] + _stats["challenges"]) / total) * 100, 1) if total else 0.0
     return web.json_response({
         "uptime": round(time.time() - _PROCESS_STARTED, 1),
-        "mode": proxy_kind or "nodriver",
+        "mode": proxy_kind or "camoufox",
         "proxy_url": proxy_url or None,
         **_stats,
         "total_requests": total,
@@ -624,17 +568,26 @@ async def handle_stats(request: web.Request) -> web.Response:
     })
 
 
-async def _stats_snapshot_loop():
-    """Persist counters every 30s so a restart resumes near where it left
-    off, without writing to disk on the request hot path."""
+def _persisted_stats() -> dict:
+    return {k: _stats[k] for k in _PERSISTED_STATS}
+
+
+async def _housekeeping_loop():
+    """Every 30s: persist counters (so a restart resumes near where it left
+    off, without disk writes on the request hot path), drop idle per-IP
+    rate-limit windows, refresh the cached WARP state."""
     while True:
         try:
             await asyncio.sleep(30)
-            db.save_stats(_stats)
+            db.save_stats(_persisted_stats())
+            cutoff = time.time() - 60
+            for ip in [ip for ip, h in _ip_hits.items() if not h or h[-1] < cutoff]:
+                _ip_hits.pop(ip, None)
+            await _refresh_warp_state()
         except asyncio.CancelledError:
             break
         except Exception:
-            log.exception("stats snapshot failed")
+            log.exception("housekeeping failed")
 
 
 async def on_startup(app):
@@ -642,10 +595,11 @@ async def on_startup(app):
     db.init()
     _ip_banned.update(db.load_bans())
     for k, v in db.load_stats().items():
-        if k in _stats:
+        if k in _PERSISTED_STATS:
             _stats[k] = v
     log.info("db loaded: %d ban(s), stats=%s", len(_ip_banned), _stats)
-    app["stats_task"] = asyncio.ensure_future(_stats_snapshot_loop())
+    await _refresh_warp_state()
+    app["housekeeping_task"] = asyncio.ensure_future(_housekeeping_loop())
 
     proxy_url, proxy_kind = _challenge_proxy()
     # Always warm the browser at startup — /solve still routes through
@@ -660,10 +614,10 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
-    task = app.get("stats_task")
+    task = app.get("housekeeping_task")
     if task:
         task.cancel()
-    db.save_stats(_stats)   # final flush
+    db.save_stats(_persisted_stats())   # final flush
     db.close()
     from . import solver as _s
     if _s._pool is None:
@@ -683,7 +637,7 @@ def main():
     # Keep the noisy libs quiet but let our own loggers through so
     # `log.exception` is actually visible for debugging.
     for name in ("aiohttp.access", "aiohttp.server", "aiohttp.web",
-                 "camoufox", "playwright", "nodriver", "nodriver.core.browser"):
+                 "camoufox", "playwright"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
     app = web.Application(client_max_size=MAX_BODY_BYTES,
@@ -692,11 +646,11 @@ def main():
              RATE_LIMIT_PER_MIN or "off", MAX_CONCURRENT_PER_IP or "off")
     if API_KEY:
         print("[solver] API key auth ENABLED", flush=True)
+    else:
+        log.warning("API_KEY unset: solve endpoints and /stats are open to anyone who can reach this port")
     app.router.add_get("/", handle_playground)
-    app.router.add_post("/solve", handle_solve)
-    app.router.add_post("/solve-challenge", handle_challenge)
-    app.router.add_post("/recaptcha-v3", handle_recaptcha)
-    app.router.add_post("/aws-token", handle_aws_token)
+    for path in _ENDPOINTS:
+        app.router.add_post(path, handle_solve)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/stats", handle_stats)
     if os.path.isdir(STATIC_DIR):

@@ -1,8 +1,7 @@
 #!/bin/bash
-# Default to headed Chromium under Xvfb. Real Cloudflare deployments
-# fingerprint --headless=new ("HeadlessChrome" UA + missing GPU/audio
-# signals) and refuse to mount the Turnstile iframe. Running under a
-# virtual X server keeps the UA clean and lets the widget render.
+# Default to headed Camoufox (Firefox) under Xvfb. Real Cloudflare
+# deployments fingerprint headless builds and refuse to mount the Turnstile
+# iframe. Running under a virtual X server lets the widget render.
 set -e
 
 if [ -z "$DISPLAY" ]; then
