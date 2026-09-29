@@ -8,7 +8,7 @@ echo "======================================="
 # 1. Update and Install System Dependencies
 echo "[*] Installing system dependencies (Python, npm, xvfb)..."
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv xvfb npm
+sudo apt install -y python3 python3-pip python3-venv xvfb nodejs
 
 # 2. Install PM2 globally
 echo "[*] Installing PM2..."
