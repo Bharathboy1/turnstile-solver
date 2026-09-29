@@ -35,6 +35,10 @@ if [ ! -f .env ]; then
     # Fix Docker paths to local paths for PM2
     sed -i 's|DB_PATH=/data/solver.db|DB_PATH=./solver.db|g' .env
     
+    # Remove Docker-specific proxies since we are running natively
+    sed -i 's|SOLVER_PROXY=http://warp:8080|SOLVER_PROXY=|g' .env
+    sed -i 's|CHALLENGE_PROXY_URL=http://byparr:8191|CHALLENGE_PROXY_URL=|g' .env
+    
     # Generate a random secure API Key
     RANDOM_KEY=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
     echo "API_KEY=$RANDOM_KEY" >> .env
