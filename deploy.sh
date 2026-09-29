@@ -44,6 +44,17 @@ fi
 # 7. Create PM2 Ecosystem File
 echo "[*] Creating PM2 ecosystem.config.js..."
 cat << 'EOF' > ecosystem.config.js
+const fs = require('fs');
+
+const envConfig = fs.readFileSync('.env', 'utf-8')
+  .split('\n')
+  .filter(line => line && !line.startsWith('#'))
+  .reduce((acc, line) => {
+    const [key, ...val] = line.split('=');
+    if (key) acc[key.trim()] = val.join('=').trim();
+    return acc;
+  }, {});
+
 module.exports = {
   apps: [{
     name: "turnstile-solver",
@@ -52,6 +63,8 @@ module.exports = {
     interpreter: "none",
     env: {
       NODE_ENV: "production",
+      DB_PATH: "solver.db",
+      ...envConfig
     }
   }]
 }
