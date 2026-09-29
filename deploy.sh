@@ -32,6 +32,9 @@ if [ ! -f .env ]; then
     echo "[*] Creating .env file from template..."
     cp .env.example .env
     
+    # Fix Docker paths to local paths for PM2
+    sed -i 's|DB_PATH=/data/solver.db|DB_PATH=./solver.db|g' .env
+    
     # Generate a random secure API Key
     RANDOM_KEY=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
     echo "API_KEY=$RANDOM_KEY" >> .env
