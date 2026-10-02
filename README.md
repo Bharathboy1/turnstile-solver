@@ -49,6 +49,8 @@ All values are environment variables. Defaults in `.env.example`.
 | `DB_PATH` | `/data/solver.db` | SQLite file for bans and counters |
 | `ALLOW_PRIVATE_TARGETS` | unset | `1` allows `siteurl` on loopback / private / link-local hosts (dev only). |
 | `SOLVER_PROXY` | unset | Outbound HTTP proxy for the browser and Byparr, e.g. `http://warp:8080` |
+| `REQUEST_PROXY_ALLOWLIST` | unset | Comma-separated allowlist for `/solve-challenge` request `proxy` values (exact hosts / `*.` wildcard hosts and/or CIDR/IP ranges). Empty disables per-request proxies. |
+| `ALLOW_PRIVATE_PROXY_TARGETS` | unset | Dev-only override. `1` allows request `proxy` hosts that resolve to loopback/private/link-local/etc addresses. |
 | `CHALLENGE_PROXY_URL` | unset | Byparr / FlareSolverr base URL. When set, `/solve-challenge` delegates to it. |
 | `CHALLENGE_PROXY_KIND` | `byparr` | `byparr` (timeouts in s) or `flaresolverr` (timeouts in ms) |
 | `TS_PROFILE_DIR` | `/tmp/ts_profile` | Persistent Camoufox profile |
@@ -64,6 +66,7 @@ Common request fields:
 |---|---|---|
 | `siteurl` | string | Required. `http`/`https`, public host. |
 | `sitekey` | string | Required on `/solve`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
+| `proxy` | string | Optional on `/solve-challenge`. Must be `http://`, `https://`, or `socks5://` with host+port, and pass `REQUEST_PROXY_ALLOWLIST`. |
 | `timeout` | int | Seconds, clamped to `5..180`, default `45`. Covers the whole request including queueing. Server aborts at `timeout + 15` s. Set your HTTP client timeout above that. |
 
 Every response carries `elapsed` (seconds). Errors:
@@ -100,7 +103,8 @@ site is never fetched), so pass the URL the sitekey is bound to.
 ### `POST /solve-challenge` — clear "Just a moment..."
 
 ```json
-{ "siteurl": "https://api.example.com/docs", "timeout": 45 }
+{ "siteurl": "https://api.example.com/docs", "timeout": 45,
+  "proxy": "******proxy.example.net:8080" }
 ```
 
 ```json
@@ -117,6 +121,11 @@ site is never fetched), so pass the URL the sitekey is bound to.
 
 Reuse `cf_clearance` together with `user_agent`; Cloudflare rejects the cookie
 under a different UA. Extensionless paths are retried with a trailing slash.
+Per-request proxy usage is disabled by default; set `REQUEST_PROXY_ALLOWLIST`
+to explicitly permit trusted proxy hosts/ranges. Request proxies are validated
+before any solve network activity, must include host+port, and cannot target
+private/loopback/link-local/multicast/reserved/unspecified addresses unless
+`ALLOW_PRIVATE_PROXY_TARGETS=1` is explicitly set for local development.
 
 ### `POST /recaptcha-v3` — reCAPTCHA v3 token
 
@@ -167,6 +176,8 @@ One line per request on stdout:
 
 Failed solves log the full trace server-side; clients get the sanitised
 `error_code` only. `LOG_LEVEL=DEBUG` adds per-step progress.
+Proxy credentials are never logged; proxy values are redacted to safe labels
+(`scheme://host:port`) where shown.
 
 ## Production notes
 
