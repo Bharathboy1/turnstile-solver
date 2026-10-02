@@ -291,8 +291,8 @@ async def _validate_request_proxy(proxy_value) -> str | None:
         parsed = urlparse(proxy)
     except Exception:
         raise ValueError("invalid proxy")
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("proxy scheme must be http or https")
+    if parsed.scheme not in ("http", "https", "socks5"):
+        raise ValueError("proxy scheme must be http, https, or socks5")
     host = parsed.hostname
     try:
         port = parsed.port

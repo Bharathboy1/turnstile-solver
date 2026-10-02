@@ -38,7 +38,14 @@ class ProxyValidationTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_scheme(self):
         service.REQUEST_PROXY_ALLOWLIST = "proxy.example.com"
         with self.assertRaisesRegex(ValueError, "scheme"):
-            await service._validate_request_proxy("socks5://proxy.example.com:8080")
+            await service._validate_request_proxy("ftp://proxy.example.com:8080")
+
+    async def test_valid_socks5_proxy(self):
+        service.REQUEST_PROXY_ALLOWLIST = "proxy.example.com"
+        with patch.object(service.asyncio, "get_event_loop",
+                          return_value=_FakeLoop(_addrinfo("93.184.216.34"))):
+            value = await service._validate_request_proxy("socks5://proxy.example.com:1080")
+        self.assertEqual(value, "socks5://proxy.example.com:1080")
 
     async def test_missing_host_or_port(self):
         service.REQUEST_PROXY_ALLOWLIST = "proxy.example.com"

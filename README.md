@@ -66,7 +66,7 @@ Common request fields:
 |---|---|---|
 | `siteurl` | string | Required. `http`/`https`, public host. |
 | `sitekey` | string | Required on `/solve`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
-| `proxy` | string | Optional on `/solve-challenge`. Must be `http://` or `https://` with host+port, and pass `REQUEST_PROXY_ALLOWLIST`. |
+| `proxy` | string | Optional on `/solve-challenge`. Must be `http://`, `https://`, or `socks5://` with host+port, and pass `REQUEST_PROXY_ALLOWLIST`. |
 | `timeout` | int | Seconds, clamped to `5..180`, default `45`. Covers the whole request including queueing. Server aborts at `timeout + 15` s. Set your HTTP client timeout above that. |
 
 Every response carries `elapsed` (seconds). Errors:
