@@ -14,7 +14,7 @@ import socket
 import sys
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from aiohttp import web
 
@@ -254,6 +254,8 @@ def _parse_proxy_allowlist(raw: str) -> tuple[set[str], list]:
 
 
 def _is_host_allowlisted(host: str, hosts: set[str]) -> bool:
+    if "*" in hosts:
+        return True
     host_l = host.lower()
     if host_l in hosts:
         return True
@@ -291,8 +293,8 @@ async def _validate_request_proxy(proxy_value) -> str | None:
         parsed = urlparse(proxy)
     except Exception:
         raise ValueError("invalid proxy")
-    if parsed.scheme not in ("http", "https", "socks5"):
-        raise ValueError("proxy scheme must be http, https, or socks5")
+    if parsed.scheme not in ("http", "https", "socks5", "socks5h"):
+        raise ValueError("proxy scheme must be http, https, socks5, or socks5h")
     host = parsed.hostname
     try:
         port = parsed.port
@@ -327,6 +329,8 @@ async def _validate_request_proxy(proxy_value) -> str | None:
     ip_allowed = any(_is_ip_allowlisted(ip_text, nets) for ip_text in resolved_ips)
     if not (host_allowed or ip_allowed):
         raise ValueError("proxy host not allowlisted")
+    if parsed.scheme == "socks5h":
+        return urlunparse(parsed._replace(scheme="socks5"))
     return proxy
 
 

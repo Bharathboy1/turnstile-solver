@@ -47,6 +47,14 @@ class ProxyValidationTests(unittest.IsolatedAsyncioTestCase):
             value = await service._validate_request_proxy("socks5://proxy.example.com:1080")
         self.assertEqual(value, "socks5://proxy.example.com:1080")
 
+    async def test_valid_authenticated_socks5h_proxy_normalized(self):
+        service.REQUEST_PROXY_ALLOWLIST = "proxy.example.com"
+        proxy = "socks5h://user" + ":pass@proxy.example.com:1080"
+        with patch.object(service.asyncio, "get_event_loop",
+                          return_value=_FakeLoop(_addrinfo("93.184.216.34"))):
+            value = await service._validate_request_proxy(proxy)
+        self.assertEqual(value, "socks5://user" + ":pass@proxy.example.com:1080")
+
     async def test_missing_host_or_port(self):
         service.REQUEST_PROXY_ALLOWLIST = "proxy.example.com"
         with self.assertRaisesRegex(ValueError, "host and port"):
@@ -65,6 +73,20 @@ class ProxyValidationTests(unittest.IsolatedAsyncioTestCase):
                           return_value=_FakeLoop(_addrinfo("8.8.8.8"))):
             value = await service._validate_request_proxy("https://proxy.lab:8443")
         self.assertEqual(value, "https://proxy.lab:8443")
+
+    async def test_allowlisted_proxy_by_global_wildcard(self):
+        service.REQUEST_PROXY_ALLOWLIST = "*"
+        with patch.object(service.asyncio, "get_event_loop",
+                          return_value=_FakeLoop(_addrinfo("93.184.216.34"))):
+            value = await service._validate_request_proxy("https://proxy.lab:8443")
+        self.assertEqual(value, "https://proxy.lab:8443")
+
+    async def test_global_wildcard_still_blocks_private_targets(self):
+        service.REQUEST_PROXY_ALLOWLIST = "*"
+        with patch.object(service.asyncio, "get_event_loop",
+                          return_value=_FakeLoop(_addrinfo("127.0.0.1"))):
+            with self.assertRaisesRegex(ValueError, "not allowed"):
+                await service._validate_request_proxy("http://proxy.lab:8080")
 
 
 class _FakeResponse:

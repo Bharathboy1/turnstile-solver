@@ -49,7 +49,7 @@ All values are environment variables. Defaults in `.env.example`.
 | `DB_PATH` | `/data/solver.db` | SQLite file for bans and counters |
 | `ALLOW_PRIVATE_TARGETS` | unset | `1` allows `siteurl` on loopback / private / link-local hosts (dev only). |
 | `SOLVER_PROXY` | unset | Outbound HTTP proxy for the browser and Byparr, e.g. `http://warp:8080` |
-| `REQUEST_PROXY_ALLOWLIST` | unset | Comma-separated allowlist for `/solve-challenge` request `proxy` values (exact hosts / `*.` wildcard hosts and/or CIDR/IP ranges). Empty disables per-request proxies. |
+| `REQUEST_PROXY_ALLOWLIST` | unset | Comma-separated allowlist for `/solve-challenge` request `proxy` values (exact hosts, `*` global wildcard, `*.` wildcard hosts and/or CIDR/IP ranges). Empty disables per-request proxies. |
 | `ALLOW_PRIVATE_PROXY_TARGETS` | unset | Dev-only override. `1` allows request `proxy` hosts that resolve to loopback/private/link-local/etc addresses. |
 | `CHALLENGE_PROXY_URL` | unset | Byparr / FlareSolverr base URL. When set, `/solve-challenge` delegates to it. |
 | `CHALLENGE_PROXY_KIND` | `byparr` | `byparr` (timeouts in s) or `flaresolverr` (timeouts in ms) |
@@ -66,7 +66,7 @@ Common request fields:
 |---|---|---|
 | `siteurl` | string | Required. `http`/`https`, public host. |
 | `sitekey` | string | Required on `/solve`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
-| `proxy` | string | Optional on `/solve-challenge`. Must be `http://`, `https://`, or `socks5://` with host+port, and pass `REQUEST_PROXY_ALLOWLIST`. |
+| `proxy` | string | Optional on `/solve-challenge`. Must be `http://`, `https://`, `socks5://`, or `socks5h://` with host+port, and pass `REQUEST_PROXY_ALLOWLIST`. |
 | `timeout` | int | Seconds, clamped to `5..180`, default `45`. Covers the whole request including queueing. Server aborts at `timeout + 15` s. Set your HTTP client timeout above that. |
 
 Every response carries `elapsed` (seconds). Errors:
