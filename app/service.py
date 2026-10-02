@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from . import db
+from .proxy_utils import has_control_chars, safe_proxy_label
 from .solver import (get_pool, solve_async, solve_challenge_async,
                      solve_recaptcha_v3_async, solve_aws_token_async,
                      _challenge_proxy)
@@ -39,6 +40,8 @@ BAN_SECONDS = int(os.environ.get("BAN_SECONDS", 86400))
 # Dev escape hatch: let siteurl point at loopback / private / link-local
 # addresses (blocked by default to stop SSRF into the docker network).
 ALLOW_PRIVATE_TARGETS = os.environ.get("ALLOW_PRIVATE_TARGETS", "").lower() in ("1", "true", "yes")
+ALLOW_PRIVATE_PROXY_TARGETS = os.environ.get("ALLOW_PRIVATE_PROXY_TARGETS", "").lower() in ("1", "true", "yes")
+REQUEST_PROXY_ALLOWLIST = os.environ.get("REQUEST_PROXY_ALLOWLIST", "").strip()
 
 log = logging.getLogger("service")
 
@@ -234,6 +237,99 @@ async def _validate_siteurl(siteurl: str) -> None:
             raise ValueError("siteurl host not allowed")
 
 
+def _parse_proxy_allowlist(raw: str) -> tuple[set[str], list]:
+    hosts: set[str] = set()
+    nets: list = []
+    for piece in (raw or "").split(","):
+        entry = piece.strip().lower()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+            continue
+        except ValueError:
+            pass
+        hosts.add(entry)
+    return hosts, nets
+
+
+def _is_host_allowlisted(host: str, hosts: set[str]) -> bool:
+    host_l = host.lower()
+    if host_l in hosts:
+        return True
+    for entry in hosts:
+        if entry.startswith("*."):
+            suffix = entry[2:]
+            if host_l == suffix or host_l.endswith("." + suffix):
+                return True
+    return False
+
+
+def _is_ip_allowlisted(ip_text: str, nets: list) -> bool:
+    if not nets:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip_text)
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in nets)
+
+
+async def _validate_request_proxy(proxy_value) -> str | None:
+    if proxy_value is None:
+        return None
+    if not isinstance(proxy_value, str):
+        raise ValueError("proxy must be a string")
+    proxy = proxy_value.strip()
+    if not proxy:
+        return None
+    if has_control_chars(proxy):
+        raise ValueError("invalid proxy")
+    if not REQUEST_PROXY_ALLOWLIST:
+        raise ValueError("per-request proxy is not enabled")
+    try:
+        parsed = urlparse(proxy)
+    except Exception:
+        raise ValueError("invalid proxy")
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("proxy scheme must be http or https")
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid proxy")
+    if not host or port is None:
+        raise ValueError("proxy must include host and port")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError("invalid proxy")
+
+    hosts, nets = _parse_proxy_allowlist(REQUEST_PROXY_ALLOWLIST)
+    if not hosts and not nets:
+        raise ValueError("per-request proxy is not enabled")
+
+    try:
+        infos = await asyncio.get_event_loop().getaddrinfo(
+            host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise ValueError("proxy host does not resolve")
+    resolved_ips = {info[4][0] for info in infos}
+    if not resolved_ips:
+        raise ValueError("proxy host does not resolve")
+
+    if not ALLOW_PRIVATE_PROXY_TARGETS:
+        if host == "localhost" or host.endswith(".localhost"):
+            raise ValueError("proxy host not allowed")
+        for ip_text in resolved_ips:
+            if _is_private_ip(ip_text):
+                raise ValueError("proxy host not allowed")
+
+    host_allowed = _is_host_allowlisted(host, hosts)
+    ip_allowed = any(_is_ip_allowlisted(ip_text, nets) for ip_text in resolved_ips)
+    if not (host_allowed or ip_allowed):
+        raise ValueError("proxy host not allowlisted")
+    return proxy
+
+
 # Paths reachable without a key even when API_KEY is set. /health stays open
 # for container/uptime probes.
 _PUBLIC_PATHS = frozenset({"/health"})
@@ -401,9 +497,10 @@ def _parse_solve(p: dict):
 
 def _parse_challenge(p: dict):
     siteurl = (p.get("siteurl") or "")
+    proxy = p.get("proxy")
 
     def run(rid, timeout):
-        return solve_challenge_async(siteurl, req_id=rid, timeout=timeout)
+        return solve_challenge_async(siteurl, req_id=rid, timeout=timeout, proxy=proxy)
     return siteurl, "", run
 
 
@@ -455,6 +552,8 @@ async def handle_solve(request: web.Request) -> web.Response:
         if siteurl_raw is not None and not isinstance(siteurl_raw, str):
             raise ValueError("siteurl must be a string")
         payload["siteurl"] = (siteurl_raw or "").strip()
+        if path == "/solve-challenge":
+            payload["proxy"] = await _validate_request_proxy(payload.get("proxy"))
         siteurl, key, run = parse(payload)
         _emit_start(rid, request.method, path, siteurl, key, peer)
         await _validate_siteurl(siteurl)
@@ -538,7 +637,7 @@ async def handle_health(request: web.Request) -> web.Response:
     proxy_url, proxy_kind = _challenge_proxy()
     body = {"status": "ok", "warp": _warp_state, **_stats}
     if proxy_url:
-        body.update(mode=proxy_kind, proxy_url=proxy_url)
+        body.update(mode=proxy_kind, proxy_url=safe_proxy_label(proxy_url))
     else:
         body.update(mode="camoufox", max_concurrent=MAX_WORKERS)
     return web.json_response(body)
@@ -559,7 +658,7 @@ async def handle_stats(request: web.Request) -> web.Response:
     return web.json_response({
         "uptime": round(time.time() - _PROCESS_STARTED, 1),
         "mode": proxy_kind or "camoufox",
-        "proxy_url": proxy_url or None,
+        "proxy_url": safe_proxy_label(proxy_url) if proxy_url else None,
         **_stats,
         "total_requests": total,
         "success_rate": success_rate,
@@ -607,7 +706,7 @@ async def on_startup(app):
     # browser meant the first /solve paid a ~30s cold-start tax.
     pool = await get_pool(MAX_WORKERS)
     if proxy_url:
-        print(f"[solver] {proxy_kind} delegation enabled ({proxy_url}); browser warm, "
+        print(f"[solver] {proxy_kind} delegation enabled ({safe_proxy_label(proxy_url)}); browser warm, "
               f"MAX_WORKERS={pool.max_concurrent}", flush=True)
     else:
         print(f"[solver] browser warm, MAX_WORKERS={pool.max_concurrent}", flush=True)

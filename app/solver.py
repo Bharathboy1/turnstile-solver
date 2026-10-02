@@ -29,6 +29,8 @@ import json
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -36,6 +38,8 @@ from urllib.parse import urlparse
 import aiohttp
 from camoufox import DefaultAddons
 from camoufox.async_api import AsyncCamoufox
+
+from .proxy_utils import safe_proxy_label
 
 
 log = logging.getLogger("solver")
@@ -132,7 +136,7 @@ class BrowserSingleton:
             os.makedirs(profile, exist_ok=True)
             proxy = _solver_proxy()
             log.info("launching camoufox profile=%s headless=%s proxy=%s",
-                     profile, _headless_mode(), proxy or "-")
+                     profile, _headless_mode(), safe_proxy_label(proxy))
             # exclude_addons=[DefaultAddons.UBO] — uBlock Origin sometimes
             # blocks the CF api.js script, which kills widget mount.
             kwargs = dict(
@@ -391,11 +395,12 @@ def _challenge_proxy() -> tuple[Optional[str], str]:
     return url, kind
 
 
-async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[dict]:
+async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int,
+                           proxy: Optional[str] = None) -> Optional[dict]:
     url, kind = _challenge_proxy()
     if not url:
         return None
-    _step(req_id, f"delegating to {kind} -> {url}")
+    _step(req_id, f"delegating to {kind} -> {safe_proxy_label(url)}")
 
     candidates = [siteurl]
     try:
@@ -413,9 +418,9 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
         payload_base = {"cmd": "request.get", "maxTimeout": max(5000, timeout * 1000)}
 
     # Route the challenge fetch through the same egress proxy as the browser.
-    proxy = _solver_proxy()
-    if proxy:
-        payload_base["proxy"] = {"url": proxy}
+    effective_proxy = proxy or _solver_proxy()
+    if effective_proxy:
+        payload_base["proxy"] = {"url": effective_proxy}
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
@@ -436,18 +441,18 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
                         except ValueError:
                             parsed = None
                         if not isinstance(parsed, dict):
-                            last_err = f"{kind}: non-JSON response: {body_text[:200]}"
+                            last_err = f"{kind}: non-JSON response"
                             continue
                         if (parsed.get("status") or "").lower() == "ok":
                             data = parsed
                             break
-                        last_err = f"{kind}: {parsed.get('message') or parsed}"
+                        last_err = f"{kind}: request failed"
                         continue
-                    last_err = f"{kind} HTTP {resp.status}: {body_text[:200]}"
+                    last_err = f"{kind} HTTP {resp.status}"
         except asyncio.TimeoutError:
             last_err = f"{kind} did not respond within {timeout + 15}s"
         except aiohttp.ClientError as e:
-            last_err = f"{kind} connection error: {e}"
+            last_err = f"{kind} connection error ({e.__class__.__name__})"
 
     if data is None:
         raise RuntimeError(last_err or f"{kind}: unknown failure")
@@ -494,12 +499,13 @@ _solve_via_flaresolverr = _solve_via_proxy
 
 
 async def solve_challenge_async(siteurl: str, req_id: str = "-",
-                                 timeout: int = 45) -> dict:
+                                 timeout: int = 45,
+                                 proxy: Optional[str] = None) -> dict:
     """Open page, wait for CF challenge to clear, return cookies + final html."""
     proxy_url, proxy_kind = _challenge_proxy()
     if proxy_url:
         try:
-            result = await _solve_via_proxy(siteurl, req_id, timeout)
+            result = await _solve_via_proxy(siteurl, req_id, timeout, proxy=proxy)
             if result is not None:
                 return result
         except Exception as e:
@@ -574,7 +580,46 @@ async def solve_challenge_async(siteurl: str, req_id: str = "-",
             "html": html_,
         }
 
+    if proxy:
+        return await _solve_challenge_with_proxy(siteurl, req_id, timeout, proxy, run)
     return await _run_in_tab(siteurl, siteurl, req_id, run)
+
+
+async def _solve_challenge_with_proxy(siteurl: str, req_id: str, timeout: int,
+                                      proxy: str, run_fn: Callable[[object, object], Awaitable[dict]]) -> dict:
+    profile = tempfile.mkdtemp(prefix="ts_proxy_", dir="/tmp")
+    kwargs = dict(
+        headless=_headless_mode(),
+        humanize=True,
+        persistent_context=True,
+        user_data_dir=profile,
+        os=["windows", "macos", "linux"],
+        locale="en-US",
+        exclude_addons=[DefaultAddons.UBO],
+        proxy={"server": proxy},
+        geoip=True,
+    )
+    _step(req_id, f"launching isolated browser proxy={safe_proxy_label(proxy)}")
+    camoufox = AsyncCamoufox(**kwargs)
+    browser = await camoufox.__aenter__()
+    page = None
+    fake_pool = type("_PoolView", (), {"browser": browser})()
+    try:
+        page = await browser.new_page()
+        try:
+            await page.goto(siteurl, wait_until="domcontentloaded", timeout=30_000)
+        except Exception as e:
+            log.warning("initial goto failed: %s", e)
+        return await run_fn(page, fake_pool)
+    finally:
+        if page is not None:
+            with contextlib.suppress(Exception):
+                await page.unroute_all()
+            with contextlib.suppress(Exception):
+                await page.close()
+        with contextlib.suppress(Exception):
+            await camoufox.__aexit__(None, None, None)
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 # ---------- reCAPTCHA v3 (Boterdrop pattern) ----------
