@@ -455,8 +455,18 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int, proxy: Optio
 
     # Route the challenge fetch through requested proxy or default egress proxy.
     egress_proxy = proxy or _solver_proxy()
+    req_headers = {}
     if egress_proxy:
         payload_base["proxy"] = {"url": egress_proxy}
+        try:
+            u = urlparse(egress_proxy)
+            req_headers["X-Proxy-Server"] = f"{u.scheme}://{u.hostname}:{u.port}"
+            if u.username:
+                req_headers["X-Proxy-Username"] = u.username
+            if u.password:
+                req_headers["X-Proxy-Password"] = u.password
+        except Exception:
+            pass
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
@@ -469,7 +479,7 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int, proxy: Optio
         try:
             conn_timeout = aiohttp.ClientTimeout(total=timeout + 15)
             async with aiohttp.ClientSession(timeout=conn_timeout) as s:
-                async with s.post(f"{url}/v1", json=payload) as resp:
+                async with s.post(f"{url}/v1", json=payload, headers=req_headers) as resp:
                     body_text = await resp.text()
                     if resp.status == 200:
                         try:
