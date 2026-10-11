@@ -140,7 +140,7 @@ class BrowserSingleton:
                 humanize=True,
                 persistent_context=True,
                 user_data_dir=profile,
-                os=["windows", "macos", "linux"],
+                os="windows",
                 locale="en-US",
                 exclude_addons=[DefaultAddons.UBO],
             )
@@ -247,7 +247,7 @@ async def _run_in_tab(key: str, url: str, req_id: str,
                 async with AsyncCamoufox(
                     headless=_headless_mode(),
                     humanize=True,
-                    os=["windows", "macos", "linux"],
+                    os="windows",
                     locale="en-US",
                     exclude_addons=[DefaultAddons.UBO],
                     proxy=proxy_dict,
