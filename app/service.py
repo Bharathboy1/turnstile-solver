@@ -392,18 +392,20 @@ def _parse_solve(p: dict):
     siteurl = (p.get("siteurl") or "")
     action = _field(p, "action", _ATTR_RE) or None
     cdata = _field(p, "cdata", _ATTR_RE) or None
+    proxy = (p.get("proxy") or "").strip() or None
 
     def run(rid, timeout):
         return solve_async(sitekey, siteurl, req_id=rid, timeout=timeout,
-                           action=action, cdata=cdata)
+                           action=action, cdata=cdata, proxy=proxy)
     return siteurl, sitekey, run
 
 
 def _parse_challenge(p: dict):
     siteurl = (p.get("siteurl") or "")
+    proxy = (p.get("proxy") or "").strip() or None
 
     def run(rid, timeout):
-        return solve_challenge_async(siteurl, req_id=rid, timeout=timeout)
+        return solve_challenge_async(siteurl, req_id=rid, timeout=timeout, proxy=proxy)
     return siteurl, "", run
 
 
@@ -411,18 +413,20 @@ def _parse_recaptcha(p: dict):
     sitekey = _field(p, "sitekey", _KEY_RE, required=True)
     siteurl = (p.get("siteurl") or "")
     action = _field(p, "action", _RC_ACTION_RE) or "verify"
+    proxy = (p.get("proxy") or "").strip() or None
 
     def run(rid, timeout):
         return solve_recaptcha_v3_async(sitekey, siteurl, req_id=rid,
-                                        timeout=timeout, action=action)
+                                        timeout=timeout, action=action, proxy=proxy)
     return siteurl, sitekey, run
 
 
 def _parse_aws(p: dict):
     siteurl = (p.get("siteurl") or "")
+    proxy = (p.get("proxy") or "").strip() or None
 
     def run(rid, timeout):
-        return solve_aws_token_async(siteurl, req_id=rid, timeout=timeout)
+        return solve_aws_token_async(siteurl, req_id=rid, timeout=timeout, proxy=proxy)
     return siteurl, "", run
 
 

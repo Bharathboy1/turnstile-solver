@@ -145,9 +145,14 @@ class BrowserSingleton:
                 exclude_addons=[DefaultAddons.UBO],
             )
             if proxy:
-                # geoip=True aligns the spoofed timezone/locale with the
-                # proxy's exit IP, so WARP's geo doesn't contradict the UA.
-                kwargs["proxy"] = {"server": proxy}
+                # Playwright/Firefox requires credentials in separate dictionary keys
+                u = urlparse(proxy)
+                proxy_dict = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+                if u.username:
+                    proxy_dict["username"] = u.username
+                if u.password:
+                    proxy_dict["password"] = u.password
+                kwargs["proxy"] = proxy_dict
                 kwargs["geoip"] = True
             self._camoufox = AsyncCamoufox(**kwargs)
             self.browser = await self._camoufox.__aenter__()
@@ -221,13 +226,48 @@ def _is_dead_browser_error(exc: BaseException) -> bool:
 
 
 async def _run_in_tab(key: str, url: str, req_id: str,
-                      fn: Callable[[object, BrowserSingleton], Awaitable]):
+                      fn: Callable[[object, BrowserSingleton], Awaitable],
+                      proxy: Optional[str] = None):
     """Common tab lifecycle for every solve: key lock (outer, so same-key
     waiters don't hold worker slots), semaphore (inner), one retry on a dead
     browser, page cleanup."""
     pool = await get_pool()
     async with pool.keyed(key):
         async with pool.sem:
+            # If an explicit proxy is requested and it differs from the warm browser's proxy,
+            # launch a dedicated Camoufox tab for that proxy.
+            if proxy and proxy.strip() and proxy.strip() != _solver_proxy():
+                u = urlparse(proxy)
+                proxy_dict = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+                if u.username:
+                    proxy_dict["username"] = u.username
+                if u.password:
+                    proxy_dict["password"] = u.password
+                _step(req_id, f"launching dedicated camoufox tab with proxy: {proxy_dict['server']}")
+                async with AsyncCamoufox(
+                    headless=_headless_mode(),
+                    humanize=True,
+                    os=["windows", "macos", "linux"],
+                    locale="en-US",
+                    exclude_addons=[DefaultAddons.UBO],
+                    proxy=proxy_dict,
+                    geoip=True,
+                ) as custom_browser:
+                    page = await custom_browser.new_page()
+                    if url:
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                        except Exception as e:
+                            log.warning("initial goto failed: %s", e)
+                    try:
+                        return await fn(page, pool)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            await page.unroute_all()
+                        with contextlib.suppress(Exception):
+                            await page.close()
+
+            # Otherwise, use the warm, instant persistent browser on default proxy (WARP)
             for attempt in (1, 2):
                 page = None
                 gen = pool.generation
@@ -345,13 +385,14 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
 
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       timeout: int = 45, action: Optional[str] = None,
-                      cdata: Optional[str] = None) -> str:
+                      cdata: Optional[str] = None,
+                      proxy: Optional[str] = None) -> str:
     _step(req_id, f"opening tab for {siteurl}")
 
     async def run(page, _pool):
         return await _turnstile_on_page(page, sitekey, siteurl, req_id, timeout, action, cdata)
 
-    return await _run_in_tab(sitekey, "", req_id, run)
+    return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
 
 
 # ---------- JS Challenge ("Just a moment...") ----------
@@ -391,7 +432,7 @@ def _challenge_proxy() -> tuple[Optional[str], str]:
     return url, kind
 
 
-async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[dict]:
+async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int, proxy: Optional[str] = None) -> Optional[dict]:
     url, kind = _challenge_proxy()
     if not url:
         return None
@@ -412,10 +453,10 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int) -> Optional[
     else:
         payload_base = {"cmd": "request.get", "maxTimeout": max(5000, timeout * 1000)}
 
-    # Route the challenge fetch through the same egress proxy as the browser.
-    proxy = _solver_proxy()
-    if proxy:
-        payload_base["proxy"] = {"url": proxy}
+    # Route the challenge fetch through requested proxy or default egress proxy.
+    egress_proxy = proxy or _solver_proxy()
+    if egress_proxy:
+        payload_base["proxy"] = {"url": egress_proxy}
 
     loop = asyncio.get_event_loop()
     t0 = loop.time()
@@ -494,12 +535,12 @@ _solve_via_flaresolverr = _solve_via_proxy
 
 
 async def solve_challenge_async(siteurl: str, req_id: str = "-",
-                                 timeout: int = 45) -> dict:
+                                 timeout: int = 45, proxy: Optional[str] = None) -> dict:
     """Open page, wait for CF challenge to clear, return cookies + final html."""
     proxy_url, proxy_kind = _challenge_proxy()
     if proxy_url:
         try:
-            result = await _solve_via_proxy(siteurl, req_id, timeout)
+            result = await _solve_via_proxy(siteurl, req_id, timeout, proxy=proxy)
             if result is not None:
                 return result
         except Exception as e:
@@ -574,7 +615,7 @@ async def solve_challenge_async(siteurl: str, req_id: str = "-",
             "html": html_,
         }
 
-    return await _run_in_tab(siteurl, siteurl, req_id, run)
+    return await _run_in_tab(siteurl, siteurl, req_id, run, proxy=proxy)
 
 
 # ---------- reCAPTCHA v3 (Boterdrop pattern) ----------
@@ -611,7 +652,8 @@ _RECAPTCHA_EXEC_JS = """
 
 
 async def solve_recaptcha_v3_async(sitekey: str, siteurl: str, req_id: str = "-",
-                                    timeout: int = 45, action: str = "verify") -> str:
+                                    timeout: int = 45, action: str = "verify",
+                                    proxy: Optional[str] = None) -> str:
     """Load the target page, ensure grecaptcha is present (inject api.js if
     not), then run grecaptcha.execute to mint a v3 token. Score-based, so a
     clean Camoufox fingerprint + WARP egress is what makes it pass."""
@@ -630,13 +672,14 @@ async def solve_recaptcha_v3_async(sitekey: str, siteurl: str, req_id: str = "-"
         _step(req_id, "recaptcha token obtained")
         return token
 
-    return await _run_in_tab(sitekey, siteurl, req_id, run)
+    return await _run_in_tab(sitekey, siteurl, req_id, run, proxy=proxy)
 
 
 # ---------- AWS WAF token (Boterdrop pattern) ----------
 
 async def solve_aws_token_async(siteurl: str, req_id: str = "-",
-                                 timeout: int = 45) -> dict:
+                                 timeout: int = 45,
+                                 proxy: Optional[str] = None) -> dict:
     """Navigate to the target and poll for the `aws-waf-token` cookie that
     the AWS WAF challenge JS sets once it clears. Returns the cookie + UA."""
     _step(req_id, f"aws-waf -> {siteurl}")
@@ -665,7 +708,7 @@ async def solve_aws_token_async(siteurl: str, req_id: str = "-",
             "url": page.url,
         }
 
-    return await _run_in_tab(siteurl, siteurl, req_id, run)
+    return await _run_in_tab(siteurl, siteurl, req_id, run, proxy=proxy)
 
 
 def solve(sitekey: str, siteurl: str, timeout: int = 45) -> str:
