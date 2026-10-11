@@ -12,6 +12,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # GPU/audio signals); running headed under Xvfb keeps the fingerprint
 # clean. Camoufox bundles its own Firefox via `python -m camoufox fetch`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        python3-dev \
         xvfb \
         dumb-init \
         ca-certificates \
