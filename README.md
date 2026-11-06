@@ -43,9 +43,13 @@ All values are environment variables. Defaults in `.env.example`.
 | `MAX_BODY_BYTES` | `65536` | Max request body |
 | `LOG_LEVEL` | `INFO` | `DEBUG` adds per-step solve progress |
 | `API_KEY` | unset | When set, every path except `/health` needs it via `X-API-Key` header or `?api_key=`. |
-| `RATE_LIMIT_PER_MIN` | `10` | Admitted solve requests per minute per client IP. Exceeding it bans the IP. `0` = off. |
-| `MAX_CONCURRENT_PER_IP` | `5` | In-flight solves per client IP. `0` = off. |
+| `RATE_LIMIT_PER_MIN` | `0` (off) | Admitted solve requests per minute per client IP. Exceeding it bans the IP. `0` = off, and bans are neither issued nor enforced. |
+| `MAX_CONCURRENT_PER_IP` | `0` (off) | In-flight solves per client IP. `0` = off. |
 | `BAN_SECONDS` | `86400` | Ban length. Bans persist in SQLite. |
+
+Toggle anti-abuse from `.env` then `docker compose up -d solver` (no rebuild): `RATE_LIMIT_PER_MIN=10` enables limit + bans, `RATE_LIMIT_PER_MIN=0` disables both.
+| `RATE_LIMIT_BYPASS_IPS` | unset | Client IPs / CIDRs (comma separated, e.g. `1.2.3.4, 10.0.0.0/8`) that skip rate limit, ban and concurrency checks entirely — for your own servers. Matches the verified client IP (the usual XFF rules apply first), never a raw header. Everyone behind the same NAT/proxy bypasses too, so pair with `API_KEY` when the port is reachable by others. |
+| `SOLVER_BIND` | `127.0.0.1` | Interface the port publishes on (compose interpolates it from `.env`). Keep loopback behind a reverse proxy; set `0.0.0.0` only with `API_KEY` when your own servers must reach it directly (e.g. over a tailnet). |
 | `DB_PATH` | `/data/solver.db` | SQLite file for bans and counters |
 | `ALLOW_PRIVATE_TARGETS` | unset | `1` allows `siteurl` on loopback / private / link-local hosts (dev only). |
 | `SOLVER_PROXY` | unset | Outbound HTTP proxy for the browser and Byparr, e.g. `http://warp:8080` |

@@ -1,5 +1,8 @@
 # playwright pinned to 1.54.0 — newer Node drivers (1.55+) crash on
 # `pageError.location.url` for real Cloudflare-protected pages.
 playwright==1.54.0
-camoufox[geoip]>=0.4
+# pinned pair: camoufox 0.5.7+ requires fpgen>=1.3, whose strict build_evidence
+# rejects the os/screen constraints we pass (InvalidConstraints at startup)
+camoufox[geoip]==0.5.6
+fpgen==1.2.1
 aiohttp>=3.10

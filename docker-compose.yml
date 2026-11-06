@@ -32,16 +32,27 @@ services:
       byparr:
         condition: service_healthy
     ports:
-      # Loopback only: the reverse proxy on the host fronts this. Publishing
-      # on 0.0.0.0 let anyone hit the port directly, spoof X-Forwarded-For
-      # and dodge the per-IP bans. Use "0.0.0.0:9988:9988" only with API_KEY set.
-      - "127.0.0.1:9988:9988"
+      # Loopback by default: the reverse proxy on the host fronts this.
+      # Publishing wider lets anyone hit the port directly, spoof
+      # X-Forwarded-For and dodge the per-IP bans — only widen SOLVER_BIND
+      # (in .env) with API_KEY set. e.g. SOLVER_BIND=0.0.0.0 for tailnet peers.
+      - "${SOLVER_BIND:-127.0.0.1}:9988:9988"
     environment:
       # Concurrent solves. Each headed Camoufox tab ~150-250MB + CPU; tune to
       # the box (4 vCPU / ~3GB free → ~12). Different sitekeys run in parallel
       # up to this; same sitekey stays serial (CF anti-abuse).
       MAX_WORKERS: "12"
       PORT: "9988"
+      # Deploy secrets live in .env (gitignored), never in this file:
+      #   API_KEY               require X-API-Key on solve endpoints
+      #   RATE_LIMIT_BYPASS_IPS own servers that skip rate limit/ban/concurrency
+      API_KEY: "${API_KEY:-}"
+      RATE_LIMIT_BYPASS_IPS: "${RATE_LIMIT_BYPASS_IPS:-}"
+      # Anti-abuse toggles (0 = off). RATE_LIMIT_PER_MIN>0 enables the limit
+      # AND bans; 0 disables both (persisted bans are ignored).
+      RATE_LIMIT_PER_MIN: "${RATE_LIMIT_PER_MIN:-0}"
+      MAX_CONCURRENT_PER_IP: "${MAX_CONCURRENT_PER_IP:-0}"
+      BAN_SECONDS: "${BAN_SECONDS:-86400}"
       # Camoufox + byparr both egress through the WARP HTTP proxy.
       SOLVER_PROXY: "http://warp:8080"
       # Byparr (Camoufox + playwright-captcha) replaces FlareSolverr.

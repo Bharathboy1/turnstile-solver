@@ -18,8 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb \
         dumb-init \
         ca-certificates \
-        wget \
-        curl \
         fonts-liberation \
         fonts-noto-core \
         fonts-noto-cjk \

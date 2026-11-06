@@ -89,7 +89,6 @@ class BrowserSingleton:
         self._key_refs: dict[str, int] = {}
         self.max_concurrent = max_concurrent
         self._start_lock = asyncio.Lock()
-        self.solve_count = 0
         self.stopped = False
         # Bumped on every launch. A solve that saw the browser die passes the
         # generation it was using to shutdown(); if another solve already
@@ -274,9 +273,7 @@ async def _run_in_tab(key: str, url: str, req_id: str,
                 try:
                     page = await pool.new_page(url)
                     gen = pool.generation
-                    result = await fn(page, pool)
-                    pool.solve_count += 1
-                    return result
+                    return await fn(page, pool)
                 except Exception as exc:
                     if attempt == 1 and _is_dead_browser_error(exc):
                         _step(req_id, f"browser dead, relaunching: {exc}")
@@ -538,10 +535,6 @@ async def _solve_via_proxy(siteurl: str, req_id: str, timeout: int, proxy: Optio
         "cookies": cookies,
         "html": html_,
     }
-
-
-# Back-compat alias
-_solve_via_flaresolverr = _solve_via_proxy
 
 
 async def solve_challenge_async(siteurl: str, req_id: str = "-",
