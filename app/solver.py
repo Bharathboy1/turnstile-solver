@@ -11,12 +11,15 @@ Design notes:
   - HTML template + click strategy borrowed from Boterdrop-Solver:
     minimal host page that loads the CF api.js, plus a CSS shrink
     hack on the .cf-turnstile div so click coordinates land on the
-    invisible-mode hit area predictably. Persistent click loop until
-    cf-turnstile-response is filled.
+    invisible-mode hit area predictably. Completion is callback-driven and
+    clicks are paced to avoid repeatedly hammering the widget.
   - Single warm browser, persistent profile. Solves are serialised
     per-sitekey (CF escalates difficulty when the same sitekey is hit by
     concurrent tabs of one profile); different keys run in parallel up to
     MAX_WORKERS via a semaphore.
+  - Idle Turnstile pages are reused only for an exact
+    origin/sitekey/action/cdata tuple. A page is exclusively leased to one
+    solve, preserving the existing concurrency and isolation guarantees.
   - solve_challenge_async optionally delegates to a Byparr /
     FlareSolverr proxy via CHALLENGE_PROXY_URL; the in-process browser
     is the fallback.
@@ -30,6 +33,7 @@ import logging
 import os
 import random
 import time
+from collections import OrderedDict
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
@@ -94,6 +98,15 @@ class BrowserSingleton:
         # generation it was using to shutdown(); if another solve already
         # relaunched, the request is ignored instead of killing the new browser.
         self.generation = 0
+        # Idle Turnstile pages. A page is removed while leased, so it can never
+        # serve two requests concurrently. Exact configuration keys avoid
+        # mixing origins, actions, or cdata values.
+        self._turnstile_pages: OrderedDict[tuple[str, str, str, str], object] = OrderedDict()
+        self._turnstile_cache_size = max(
+            0, int(os.environ.get("TURNSTILE_PAGE_CACHE_SIZE", max_concurrent))
+        )
+        self.turnstile_cache_hits = 0
+        self.turnstile_cache_misses = 0
 
     @contextlib.asynccontextmanager
     async def keyed(self, key: str):
@@ -120,6 +133,7 @@ class BrowserSingleton:
                 return
             if self.browser is not None or self._camoufox is not None:
                 log.warning("browser handle stale, relaunching camoufox")
+                await self._close_turnstile_pages()
                 try:
                     if self._camoufox is not None:
                         await self._camoufox.__aexit__(None, None, None)
@@ -177,6 +191,59 @@ class BrowserSingleton:
                 log.warning("initial goto failed: %s", e)
         return page
 
+    async def acquire_turnstile_page(
+        self, key: tuple[str, str, str, str]
+    ) -> tuple[object, bool]:
+        """Exclusively lease an idle page for an exact widget configuration."""
+        await self.ensure()
+        page = self._turnstile_pages.pop(key, None)
+        if page is not None:
+            try:
+                if not page.is_closed():
+                    self.turnstile_cache_hits += 1
+                    return page, True
+            except Exception:
+                pass
+            with contextlib.suppress(Exception):
+                await page.close()
+
+        self.turnstile_cache_misses += 1
+        return await self.new_page(), False
+
+    async def release_turnstile_page(
+        self, key: tuple[str, str, str, str], page
+    ) -> None:
+        """Return a healthy page to the bounded LRU cache, or close it."""
+        try:
+            closed = page.is_closed()
+        except Exception:
+            closed = True
+        if closed or self._turnstile_cache_size <= 0 or self.stopped:
+            with contextlib.suppress(Exception):
+                await page.close()
+            return
+
+        replaced = self._turnstile_pages.pop(key, None)
+        if replaced is not None and replaced is not page:
+            await self.discard_turnstile_page(replaced)
+        self._turnstile_pages[key] = page
+
+        while len(self._turnstile_pages) > self._turnstile_cache_size:
+            _, stale = self._turnstile_pages.popitem(last=False)
+            await self.discard_turnstile_page(stale)
+
+    async def discard_turnstile_page(self, page) -> None:
+        with contextlib.suppress(Exception):
+            await page.unroute_all()
+        with contextlib.suppress(Exception):
+            await page.close()
+
+    async def _close_turnstile_pages(self) -> None:
+        pages = list(self._turnstile_pages.values())
+        self._turnstile_pages.clear()
+        for page in pages:
+            await self.discard_turnstile_page(page)
+
     async def shutdown(self, generation: Optional[int] = None):
         """Tear the browser down. With `generation`, only if that generation
         is still the live one (a dead-browser report about an old launch must
@@ -186,6 +253,7 @@ class BrowserSingleton:
         if self.stopped and self.browser is None:
             return
         self.stopped = True
+        await self._close_turnstile_pages()
         if self._camoufox is not None:
             try:
                 await self._camoufox.__aexit__(None, None, None)
@@ -303,6 +371,12 @@ _HOST_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>.</title>
+<script>
+window.__tsToken = '';
+window.__tsSolved = function(token) { window.__tsToken = token || ''; };
+window.__tsExpired = function() { window.__tsToken = ''; };
+window.__tsError = function() { window.__tsToken = ''; };
+</script>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
 </head>
 <body>
@@ -328,28 +402,52 @@ def _attr(v: str) -> str:
 
 async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
                               timeout: int, action: Optional[str] = None,
-                              cdata: Optional[str] = None) -> str:
-    """Solve Turnstile via route-intercepted host HTML (Boterdrop pattern)."""
+                              cdata: Optional[str] = None,
+                              reuse: bool = False) -> str:
+    """Solve Turnstile on a fresh or exclusively leased intercepted page."""
     loop = asyncio.get_event_loop()
     t0 = loop.time()
 
     target = siteurl if siteurl.endswith("/") else siteurl + "/"
 
-    # Attribute-escaped: the host page is served under the target's origin
-    # inside the shared persistent profile, so raw interpolation would let a
-    # caller run script with that origin's cookies.
-    widget_div = (
-        f'<div class="cf-turnstile" style="background:white;" data-sitekey="{_attr(sitekey)}"'
-        + (f' data-action="{_attr(action)}"' if action else "")
-        + (f' data-cdata="{_attr(cdata)}"' if cdata else "")
-        + "></div>"
-    )
-    body = _HOST_HTML.replace("__WIDGET__", widget_div)
+    if reuse:
+        try:
+            reusable = page.url == target and await page.evaluate(
+                """() => {
+                    window.__tsToken = '';
+                    const input = document.querySelector('[name="cf-turnstile-response"]');
+                    if (input) input.value = '';
+                    if (typeof window.turnstile === 'undefined') return false;
+                    try { window.turnstile.reset(); return true; }
+                    catch (_) { return false; }
+                }"""
+            )
+        except Exception:
+            reusable = False
+        if reusable:
+            _step(req_id, f"reused loaded Turnstile page {target}")
+        else:
+            reuse = False
 
-    await page.route(target, lambda route: route.fulfill(
-        body=body, status=200, content_type="text/html; charset=utf-8"))
-    await page.goto(target)
-    _step(req_id, f"route intercepted {target}")
+    if not reuse:
+        with contextlib.suppress(Exception):
+            await page.unroute_all()
+        # Attribute-escaped: the host page is served under the target's origin
+        # inside the shared persistent profile, so raw interpolation would let
+        # a caller run script with that origin's cookies.
+        widget_div = (
+            f'<div class="cf-turnstile" style="background:white;" data-sitekey="{_attr(sitekey)}"'
+            + (f' data-action="{_attr(action)}"' if action else "")
+            + (f' data-cdata="{_attr(cdata)}"' if cdata else "")
+            + ' data-callback="__tsSolved" data-expired-callback="__tsExpired"'
+            + ' data-error-callback="__tsError"></div>'
+        )
+        body = _HOST_HTML.replace("__WIDGET__", widget_div)
+
+        await page.route(target, lambda route: route.fulfill(
+            body=body, status=200, content_type="text/html; charset=utf-8"))
+        await page.goto(target, wait_until="domcontentloaded")
+        _step(req_id, f"route intercepted {target}")
 
     # CSS hack from Boterdrop — narrowing the cf-turnstile div makes
     # the click coords land on the checkbox hit area in invisible mode.
@@ -361,21 +459,56 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
         pass
 
     deadline = t0 + timeout
-    poll = 0.3
-    while loop.time() < deadline:
+
+    async def paced_clicks() -> None:
+        widget = page.locator("//div[@class='cf-turnstile']")
+        # Wait for Cloudflare's iframe instead of clicking an empty host div.
+        # Token waiting runs concurrently, so invisible widgets can complete
+        # without being delayed by this readiness check.
         try:
-            value = await page.input_value("[name=cf-turnstile-response]", timeout=400)
-        except Exception:
-            value = None
-        if value:
-            _step(req_id, f"token obtained ({loop.time() - t0:.1f}s)")
-            return value
-        # Click the parent div to coax invisible widgets into firing.
-        try:
-            await page.locator("//div[@class='cf-turnstile']").click(timeout=400)
+            await page.locator(
+                'iframe[src*="challenges.cloudflare.com"]'
+            ).first.wait_for(state="visible", timeout=3_000)
         except Exception:
             pass
-        await asyncio.sleep(poll)
+        for _ in range(4):
+            if loop.time() >= deadline:
+                return
+            try:
+                value = await page.evaluate(
+                    """() => window.__tsToken ||
+                    (document.querySelector('[name="cf-turnstile-response"]') || {}).value || ''"""
+                )
+                if value:
+                    return
+                await widget.click(timeout=1_200)
+            except Exception:
+                pass
+            await asyncio.sleep(4.0)
+
+    click_task = asyncio.create_task(paced_clicks())
+    try:
+        remaining_ms = max(1, int((deadline - loop.time()) * 1000))
+        await page.wait_for_function(
+            """() => Boolean(window.__tsToken ||
+            (document.querySelector('[name="cf-turnstile-response"]') || {}).value)""",
+            timeout=remaining_ms,
+        )
+        value = await page.evaluate(
+            """() => window.__tsToken ||
+            (document.querySelector('[name="cf-turnstile-response"]') || {}).value || ''"""
+        )
+        if value:
+            _step(req_id, f"token obtained ({loop.time() - t0:.1f}s, reused={reuse})")
+            return value
+    except Exception as exc:
+        if loop.time() < deadline:
+            raise
+        raise TimeoutError(f"turnstile timeout after {timeout}s") from exc
+    finally:
+        click_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await click_task
 
     raise TimeoutError(f"turnstile timeout after {timeout}s")
 
@@ -386,10 +519,53 @@ async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       proxy: Optional[str] = None) -> str:
     _step(req_id, f"opening tab for {siteurl}")
 
-    async def run(page, _pool):
-        return await _turnstile_on_page(page, sitekey, siteurl, req_id, timeout, action, cdata)
+    # Explicit per-request proxies launch isolated Camoufox instances and keep
+    # the close-after-solve lifecycle. Reuse is limited to the warm default
+    # browser, where origin, profile, UA and egress remain identical.
+    if proxy and proxy.strip() and proxy.strip() != _solver_proxy():
+        async def run(page, _pool):
+            return await _turnstile_on_page(
+                page, sitekey, siteurl, req_id, timeout, action, cdata
+            )
 
-    return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
+        return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
+
+    pool = await get_pool()
+    target = siteurl if siteurl.endswith("/") else siteurl + "/"
+    page_key = (target, sitekey, action or "", cdata or "")
+
+    async with pool.keyed(sitekey):
+        async with pool.sem:
+            for attempt in (1, 2):
+                page = None
+                gen = pool.generation
+                try:
+                    page, reused = await pool.acquire_turnstile_page(page_key)
+                    gen = pool.generation
+                    token = await _turnstile_on_page(
+                        page,
+                        sitekey,
+                        siteurl,
+                        req_id,
+                        timeout,
+                        action,
+                        cdata,
+                        reuse=reused,
+                    )
+                    await pool.release_turnstile_page(page_key, page)
+                    page = None
+                    return token
+                except Exception as exc:
+                    if page is not None:
+                        await pool.discard_turnstile_page(page)
+                        page = None
+                    if attempt == 1 and _is_dead_browser_error(exc):
+                        _step(req_id, f"browser dead, relaunching: {exc}")
+                        await pool.shutdown(gen)
+                        continue
+                    raise
+
+    raise RuntimeError("solve_async: unreachable")
 
 
 # ---------- JS Challenge ("Just a moment...") ----------

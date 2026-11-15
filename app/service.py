@@ -573,6 +573,14 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def handle_stats(request: web.Request) -> web.Response:
     proxy_url, proxy_kind = _challenge_proxy()
+    from . import solver as _solver_module
+    pool = _solver_module._pool
+    page_cache = {
+        "capacity": pool._turnstile_cache_size if pool else 0,
+        "idle": len(pool._turnstile_pages) if pool else 0,
+        "hits": pool.turnstile_cache_hits if pool else 0,
+        "misses": pool.turnstile_cache_misses if pool else 0,
+    }
     lat = list(_latency_ms)
     lat_sorted = sorted(lat)
     def pct(arr, p):
@@ -590,6 +598,7 @@ async def handle_stats(request: web.Request) -> web.Response:
         **_stats,
         "total_requests": total,
         "success_rate": success_rate,
+        "turnstile_page_cache": page_cache,
         "latency_ms": {"avg": avg, "p50": pct(lat_sorted, 50), "p95": pct(lat_sorted, 95), "samples": len(lat)},
         "events": list(_events),
     })
