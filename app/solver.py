@@ -224,9 +224,10 @@ class BrowserSingleton:
             return
 
         try:
-            reusable = await page.evaluate(
-                "() => Boolean(window.__tsTeardown && window.__tsTeardown())"
+            await page.evaluate(
+                "() => { if (window.__tsTeardown) window.__tsTeardown(); }"
             )
+            reusable = True
         except Exception:
             reusable = False
         if not reusable:
