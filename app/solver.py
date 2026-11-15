@@ -383,11 +383,40 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
 async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
                       timeout: int = 45, action: Optional[str] = None,
                       cdata: Optional[str] = None,
-                      proxy: Optional[str] = None) -> str:
+                      proxy: Optional[str] = None,
+                      return_context: bool = False):
     _step(req_id, f"opening tab for {siteurl}")
 
     async def run(page, _pool):
-        return await _turnstile_on_page(page, sitekey, siteurl, req_id, timeout, action, cdata)
+        token = await _turnstile_on_page(
+            page, sitekey, siteurl, req_id, timeout, action, cdata
+        )
+        if not return_context:
+            return token
+
+        # The widget can set cf_clearance shortly after token redemption.
+        # Return cookies from this exact browser/proxy/UA context so callers do
+        # not need a second challenge browser with a potentially different IP.
+        await asyncio.sleep(2)
+        user_agent = await page.evaluate("navigator.userAgent")
+        target_host = urlparse(siteurl).hostname or ""
+        raw_cookies = await page.context.cookies(siteurl)
+        cookies = [
+            {
+                "name": cookie["name"],
+                "value": cookie["value"],
+                "domain": cookie.get("domain", ""),
+                "path": cookie.get("path", "/"),
+                "expires": cookie.get("expires", -1),
+            }
+            for cookie in raw_cookies
+            if _match_host(target_host, cookie.get("domain", ""))
+        ]
+        return {
+            "token": token,
+            "user_agent": user_agent,
+            "cookies": cookies,
+        }
 
     return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
 

@@ -413,10 +413,21 @@ def _parse_solve(p: dict):
     action = _field(p, "action", _ATTR_RE) or None
     cdata = _field(p, "cdata", _ATTR_RE) or None
     proxy = (p.get("proxy") or "").strip() or None
+    return_context = p.get("return_context", False)
+    if not isinstance(return_context, bool):
+        raise ValueError("return_context must be a boolean")
 
     def run(rid, timeout):
-        return solve_async(sitekey, siteurl, req_id=rid, timeout=timeout,
-                           action=action, cdata=cdata, proxy=proxy)
+        return solve_async(
+            sitekey,
+            siteurl,
+            req_id=rid,
+            timeout=timeout,
+            action=action,
+            cdata=cdata,
+            proxy=proxy,
+            return_context=return_context,
+        )
     return siteurl, sitekey, run
 
 
