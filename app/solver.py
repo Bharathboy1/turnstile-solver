@@ -17,9 +17,9 @@ Design notes:
     per-sitekey (CF escalates difficulty when the same sitekey is hit by
     concurrent tabs of one profile); different keys run in parallel up to
     MAX_WORKERS via a semaphore.
-  - Idle Turnstile pages are reused only for an exact
-    origin/sitekey/action/cdata tuple. A page is exclusively leased to one
-    solve, preserving the existing concurrency and isolation guarantees.
+  - Idle API-loaded pages are reused by exact origin. Challenge iframes are
+    removed before caching; each exclusive lease renders its own
+    sitekey/action/cdata, preserving concurrency and isolation guarantees.
   - solve_challenge_async optionally delegates to a Byparr /
     FlareSolverr proxy via CHALLENGE_PROXY_URL; the in-process browser
     is the fallback.
@@ -27,7 +27,6 @@ Design notes:
 
 import asyncio
 import contextlib
-import html
 import json
 import logging
 import os
@@ -98,12 +97,12 @@ class BrowserSingleton:
         # generation it was using to shutdown(); if another solve already
         # relaunched, the request is ignored instead of killing the new browser.
         self.generation = 0
-        # Idle Turnstile pages. A page is removed while leased, so it can never
-        # serve two requests concurrently. Exact configuration keys avoid
-        # mixing origins, actions, or cdata values.
+        # Idle API-loaded Turnstile pages. A page is removed while leased, so it
+        # can never serve two requests concurrently. Challenge iframes are torn
+        # down before caching; exact request parameters are rendered on lease.
         self._turnstile_pages: OrderedDict[tuple[str, str, str, str], object] = OrderedDict()
         self._turnstile_cache_size = max(
-            0, int(os.environ.get("TURNSTILE_PAGE_CACHE_SIZE", max_concurrent))
+            0, int(os.environ.get("TURNSTILE_PAGE_CACHE_SIZE", min(4, max_concurrent)))
         )
         self.turnstile_cache_hits = 0
         self.turnstile_cache_misses = 0
@@ -221,6 +220,16 @@ class BrowserSingleton:
         if closed or self._turnstile_cache_size <= 0 or self.stopped:
             with contextlib.suppress(Exception):
                 await page.close()
+            return
+
+        try:
+            reusable = await page.evaluate(
+                "() => Boolean(window.__tsTeardown && window.__tsTeardown())"
+            )
+        except Exception:
+            reusable = False
+        if not reusable:
+            await self.discard_turnstile_page(page)
             return
 
         replaced = self._turnstile_pages.pop(key, None)
@@ -373,14 +382,40 @@ _HOST_HTML = """<!DOCTYPE html>
 <title>.</title>
 <script>
 window.__tsToken = '';
+window.__tsWidgetId = null;
+window.__tsApiReady = false;
 window.__tsSolved = function(token) { window.__tsToken = token || ''; };
 window.__tsExpired = function() { window.__tsToken = ''; };
 window.__tsError = function() { window.__tsToken = ''; };
+window.onloadTurnstileCallback = function() { window.__tsApiReady = true; };
+window.__tsTeardown = function() {
+    window.__tsToken = '';
+    if (window.__tsWidgetId !== null && window.turnstile) {
+        try { window.turnstile.remove(window.__tsWidgetId); } catch (_) {}
+    }
+    window.__tsWidgetId = null;
+    var host = document.getElementById('cf-turnstile-host');
+    if (host) host.replaceChildren();
+    return true;
+};
+window.__tsRender = function(config) {
+    window.__tsTeardown();
+    var options = {
+        sitekey: config.sitekey,
+        callback: window.__tsSolved,
+        'expired-callback': window.__tsExpired,
+        'error-callback': window.__tsError
+    };
+    if (config.action) options.action = config.action;
+    if (config.cdata) options.cData = config.cdata;
+    window.__tsWidgetId = window.turnstile.render('#cf-turnstile-host', options);
+    return window.__tsWidgetId;
+};
 </script>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onloadTurnstileCallback" async defer></script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&amp;onload=onloadTurnstileCallback" async defer></script>
 </head>
 <body>
-__WIDGET__
+<div id="cf-turnstile-host" style="background:white;width:70px"></div>
 <p id="ip-display"></p>
 </body>
 </html>"""
@@ -396,10 +431,6 @@ _IS_CHALLENGE_JS = """
 """
 
 
-def _attr(v: str) -> str:
-    return html.escape(str(v), quote=True)
-
-
 async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
                               timeout: int, action: Optional[str] = None,
                               cdata: Optional[str] = None,
@@ -410,58 +441,37 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
 
     target = siteurl if siteurl.endswith("/") else siteurl + "/"
 
-    if reuse:
-        try:
-            reusable = page.url == target and await page.evaluate(
-                """() => {
-                    window.__tsToken = '';
-                    const input = document.querySelector('[name="cf-turnstile-response"]');
-                    if (input) input.value = '';
-                    if (typeof window.turnstile === 'undefined') return false;
-                    try { window.turnstile.reset(); return true; }
-                    catch (_) { return false; }
-                }"""
-            )
-        except Exception:
-            reusable = False
-        if reusable:
-            _step(req_id, f"reused loaded Turnstile page {target}")
-        else:
-            reuse = False
+    if reuse and page.url != target:
+        reuse = False
 
     if not reuse:
         with contextlib.suppress(Exception):
             await page.unroute_all()
-        # Attribute-escaped: the host page is served under the target's origin
-        # inside the shared persistent profile, so raw interpolation would let
-        # a caller run script with that origin's cookies.
-        widget_div = (
-            f'<div class="cf-turnstile" style="background:white;" data-sitekey="{_attr(sitekey)}"'
-            + (f' data-action="{_attr(action)}"' if action else "")
-            + (f' data-cdata="{_attr(cdata)}"' if cdata else "")
-            + ' data-callback="__tsSolved" data-expired-callback="__tsExpired"'
-            + ' data-error-callback="__tsError"></div>'
-        )
-        body = _HOST_HTML.replace("__WIDGET__", widget_div)
-
         await page.route(target, lambda route: route.fulfill(
-            body=body, status=200, content_type="text/html; charset=utf-8"))
+            body=_HOST_HTML, status=200, content_type="text/html; charset=utf-8"))
         await page.goto(target, wait_until="domcontentloaded")
         _step(req_id, f"route intercepted {target}")
+    else:
+        _step(req_id, f"reused API-loaded Turnstile page {target}")
 
-    # CSS hack from Boterdrop — narrowing the cf-turnstile div makes
-    # the click coords land on the checkbox hit area in invisible mode.
-    try:
-        await page.eval_on_selector(
-            "//div[@class='cf-turnstile']", "el => el.style.width = '70px'"
-        )
-    except Exception:
-        pass
+    api_timeout = max(1, min(15_000, int((t0 + timeout - loop.time()) * 1000)))
+    await page.wait_for_function(
+        "() => window.__tsApiReady && typeof window.turnstile !== 'undefined'",
+        timeout=api_timeout,
+    )
+    await page.evaluate(
+        "config => window.__tsRender(config)",
+        {
+            "sitekey": sitekey,
+            "action": action or "",
+            "cdata": cdata or "",
+        },
+    )
 
     deadline = t0 + timeout
 
     async def paced_clicks() -> None:
-        widget = page.locator("//div[@class='cf-turnstile']")
+        widget = page.locator("#cf-turnstile-host")
         # Wait for Cloudflare's iframe instead of clicking an empty host div.
         # Token waiting runs concurrently, so invisible widgets can complete
         # without being delayed by this readiness check.
@@ -532,7 +542,9 @@ async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
 
     pool = await get_pool()
     target = siteurl if siteurl.endswith("/") else siteurl + "/"
-    page_key = (target, sitekey, action or "", cdata or "")
+    # The idle page retains only the loaded API. The challenge iframe is
+    # removed on release and exact sitekey/action/cdata are rendered per lease.
+    page_key = (target, "", "", "")
 
     async with pool.keyed(sitekey):
         async with pool.sem:

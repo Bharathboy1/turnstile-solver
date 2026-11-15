@@ -13,6 +13,9 @@ class FakePage:
     def is_closed(self):
         return self.closed
 
+    async def evaluate(self, _script):
+        return True
+
     async def unroute_all(self):
         self.unrouted = True
 
