@@ -2,33 +2,11 @@ services:
   # Cloudflare WARP as an HTTP/SOCKS proxy (not a gateway). solver + byparr
   # keep their own network and route outbound through warp:8080. Set
   # WARP_INSTANCES>1 for round-robin IP rotation across multiple WARP daemons.
-  warp:
-    image: dublok/cloudflare-warp:latest
-    container_name: violetics-warp
-    restart: unless-stopped
-    environment:
-      WARP_INSTANCES: "1"
-      WARP_CONNECT_TIMEOUT: "30"
-    volumes:
-      - warp-data:/var/lib/cloudflare-warp
-    healthcheck:
-      # healthy == egress actually exits through WARP (warp=on), proven via
-      # the HTTP proxy on :8080, not just that the daemon is up.
-      test:
-        - CMD-SHELL
-        - "curl -fsS --max-time 5 -x http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace | grep -qE 'warp=(on|plus)'"
-      interval: 15s
-      timeout: 10s
-      retries: 8
-      start_period: 60s
-
   solver:
     build: .
     container_name: violetics-solver
     restart: unless-stopped
     depends_on:
-      warp:
-        condition: service_healthy
       byparr:
         condition: service_healthy
     ports:
@@ -54,7 +32,7 @@ services:
       MAX_CONCURRENT_PER_IP: "${MAX_CONCURRENT_PER_IP:-0}"
       BAN_SECONDS: "${BAN_SECONDS:-86400}"
       # Camoufox + byparr both egress through the WARP HTTP proxy.
-      SOLVER_PROXY: "http://warp:8080"
+      SOLVER_PROXY: "${SOLVER_PROXY}"
       # Byparr (Camoufox + playwright-captcha) replaces FlareSolverr.
       # FS v3.4.6 times out on current CF interactive challenges; Byparr
       # uses a stealthier fingerprint and actively tracks CF changes.
@@ -91,4 +69,3 @@ services:
 volumes:
   solver-profile:
   solver-data:
-  warp-data:
