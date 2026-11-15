@@ -456,7 +456,7 @@ async def _turnstile_on_page(page, sitekey: str, siteurl: str, req_id: str,
 
     api_timeout = max(1, min(15_000, int((t0 + timeout - loop.time()) * 1000)))
     await page.wait_for_function(
-        "() => window.__tsApiReady && typeof window.turnstile !== 'undefined'",
+        "() => typeof window.turnstile !== 'undefined'",
         timeout=api_timeout,
     )
     await page.evaluate(
