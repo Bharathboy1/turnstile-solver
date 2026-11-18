@@ -17,6 +17,7 @@ async def _noop(*a, **k):
 
 fake.get_pool = _noop
 fake.solve_async = _noop
+fake.solve_preclearance_async = _noop
 fake.solve_challenge_async = _noop
 fake.solve_recaptcha_v3_async = _noop
 fake.solve_aws_token_async = _noop

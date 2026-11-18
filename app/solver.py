@@ -421,6 +421,134 @@ async def solve_async(sitekey: str, siteurl: str, req_id: str = "-",
     return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
 
 
+def _valid_preclearance_url(clearance_url: str, siteurl: str) -> bool:
+    """Accept only Cloudflare's dynamic pre-clearance path on the target origin."""
+    try:
+        target = urlparse(siteurl)
+        candidate = urlparse(clearance_url)
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        candidate_port = candidate.port or (
+            443 if candidate.scheme == "https" else 80
+        )
+        return (
+            candidate.scheme == target.scheme
+            and (candidate.hostname or "").lower()
+            == (target.hostname or "").lower()
+            and candidate_port == target_port
+            and candidate.path.startswith("/cdn-cgi/challenge-platform/")
+            and "/c/" in candidate.path
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+async def solve_preclearance_async(
+    sitekey: str,
+    siteurl: str,
+    req_id: str = "-",
+    timeout: int = 45,
+    action: Optional[str] = None,
+    cdata: Optional[str] = None,
+    proxy: Optional[str] = None,
+) -> dict:
+    """Return Turnstile's primary token and unredeemed pre-clearance exchange.
+
+    Turnstile pre-clearance normally redeems ``secondaryToken`` from the
+    browser that solved the widget.  This mode intercepts that one-time
+    same-origin request, acknowledges it locally so the widget can complete,
+    and lets the API caller redeem it from its own HTTP/proxy session.
+    """
+    _step(req_id, f"opening pre-clearance tab for {siteurl}")
+
+    async def run(page, _pool):
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        captured: asyncio.Future = loop.create_future()
+
+        async def capture_preclearance(route):
+            request = route.request
+            try:
+                payload = request.post_data_json
+            except Exception:
+                try:
+                    payload = json.loads(request.post_data or "{}")
+                except (TypeError, ValueError):
+                    payload = {}
+
+            secondary_token = (
+                payload.get("secondaryToken")
+                if isinstance(payload, dict)
+                else None
+            )
+            request_sitekey = (
+                payload.get("sitekey") if isinstance(payload, dict) else None
+            )
+            if (
+                request.method.upper() == "POST"
+                and secondary_token
+                and request_sitekey == sitekey
+                and _valid_preclearance_url(request.url, siteurl)
+                and not captured.done()
+            ):
+                captured.set_result(
+                    {
+                        "secondary_token": secondary_token,
+                        "clearance_url": request.url,
+                    }
+                )
+                # api.js requires HTTP 200 before it invokes the widget's
+                # success callback.  Do not forward the one-time token here.
+                await route.fulfill(
+                    status=200,
+                    body="",
+                    content_type="application/json",
+                )
+                return
+            await route.continue_()
+
+        await page.route(
+            "**/cdn-cgi/challenge-platform/**/c/**",
+            capture_preclearance,
+        )
+        token = await _turnstile_on_page(
+            page,
+            sitekey,
+            siteurl,
+            req_id,
+            timeout,
+            action,
+            cdata,
+        )
+
+        if not captured.done():
+            remaining = max(0.0, deadline - loop.time())
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"pre-clearance exchange not observed within {timeout}s"
+                )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(captured),
+                    timeout=min(5.0, remaining),
+                )
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(
+                    "Turnstile widget did not emit a pre-clearance exchange"
+                ) from exc
+
+        exchange = captured.result()
+        user_agent = await page.evaluate("navigator.userAgent")
+        _step(req_id, "primary and secondary Turnstile tokens obtained")
+        return {
+            "token": token,
+            "secondary_token": exchange["secondary_token"],
+            "clearance_url": exchange["clearance_url"],
+            "user_agent": user_agent,
+        }
+
+    return await _run_in_tab(sitekey, "", req_id, run, proxy=proxy)
+
+
 # ---------- JS Challenge ("Just a moment...") ----------
 
 _CF_WIDGET_RECT_JS = """

@@ -19,7 +19,8 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from . import db
-from .solver import (get_pool, solve_async, solve_challenge_async,
+from .solver import (get_pool, solve_async, solve_preclearance_async,
+                     solve_challenge_async,
                      solve_recaptcha_v3_async, solve_aws_token_async,
                      _challenge_proxy)
 
@@ -140,7 +141,8 @@ _req_ctx: "dict[str, dict]" = {}
 
 
 def _short_ep(path: str) -> str:
-    return {"/solve": "turnstile", "/solve-challenge": "challenge",
+    return {"/solve": "turnstile", "/solve-preclearance": "preclear",
+            "/solve-challenge": "challenge",
             "/recaptcha-v3": "recaptcha", "/aws-token": "aws-waf"}.get(path, path)
 
 
@@ -261,7 +263,13 @@ async def auth_middleware(request: web.Request, handler):
 
 
 # Solve endpoints are the expensive ones worth protecting from abuse.
-_SOLVE_PATHS = frozenset({"/solve", "/solve-challenge", "/recaptcha-v3", "/aws-token"})
+_SOLVE_PATHS = frozenset({
+    "/solve",
+    "/solve-preclearance",
+    "/solve-challenge",
+    "/recaptcha-v3",
+    "/aws-token",
+})
 
 # Per-IP state: sliding-window request timestamps, in-flight count, ban expiry.
 _ip_hits: "dict[str, collections.deque[float]]" = collections.defaultdict(collections.deque)
@@ -431,6 +439,26 @@ def _parse_solve(p: dict):
     return siteurl, sitekey, run
 
 
+def _parse_preclearance(p: dict):
+    sitekey = _field(p, "sitekey", _KEY_RE, required=True)
+    siteurl = (p.get("siteurl") or "")
+    action = _field(p, "action", _ATTR_RE) or None
+    cdata = _field(p, "cdata", _ATTR_RE) or None
+    proxy = (p.get("proxy") or "").strip() or None
+
+    def run(rid, timeout):
+        return solve_preclearance_async(
+            sitekey,
+            siteurl,
+            req_id=rid,
+            timeout=timeout,
+            action=action,
+            cdata=cdata,
+            proxy=proxy,
+        )
+    return siteurl, sitekey, run
+
+
 def _parse_challenge(p: dict):
     siteurl = (p.get("siteurl") or "")
     proxy = (p.get("proxy") or "").strip() or None
@@ -464,6 +492,7 @@ def _parse_aws(p: dict):
 # path -> (stats counter bumped on success, payload parser)
 _ENDPOINTS = {
     "/solve": ("solved", _parse_solve),
+    "/solve-preclearance": ("solved", _parse_preclearance),
     "/solve-challenge": ("challenges", _parse_challenge),
     "/recaptcha-v3": ("solved", _parse_recaptcha),
     "/aws-token": ("challenges", _parse_aws),

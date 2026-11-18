@@ -67,7 +67,7 @@ Common request fields:
 | Field | Type | Notes |
 |---|---|---|
 | `siteurl` | string | Required. `http`/`https`, public host. |
-| `sitekey` | string | Required on `/solve`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
+| `sitekey` | string | Required on `/solve`, `/solve-preclearance`, `/recaptcha-v3`. `[A-Za-z0-9_-]{1,128}` |
 | `timeout` | int | Seconds, clamped to `5..180`, default `45`. Covers the whole request including queueing. Server aborts at `timeout + 15` s. Set your HTTP client timeout above that. |
 
 Every response carries `elapsed` (seconds). Errors:
@@ -100,6 +100,34 @@ site is never fetched), so pass the URL the sitekey is bound to.
 ```json
 { "token": "1.abc...xyz", "elapsed": 6.14 }
 ```
+
+### `POST /solve-preclearance` — Turnstile token pair
+
+Captures Turnstile's unredeemed pre-clearance exchange so the caller can
+redeem it from the caller's own HTTP/proxy session. Request fields match
+`/solve`:
+
+```json
+{ "sitekey": "0x4AAAAAAC3x1HiBz5IFyj7s", "siteurl": "https://www.example.com/",
+  "timeout": 45, "action": "login", "cdata": "optional" }
+```
+
+```json
+{
+  "token": "1.primary...",
+  "secondary_token": "1.secondary...",
+  "clearance_url": "https://www.example.com/cdn-cgi/challenge-platform/h/b/c/...",
+  "user_agent": "Mozilla/5.0 ...",
+  "elapsed": 6.42
+}
+```
+
+The solver acknowledges but does not forward the browser's secondary-token
+request. The caller must POST
+`{"secondaryToken": secondary_token, "sitekey": sitekey}` to `clearance_url`
+from the session that needs `cf_clearance`. Tokens are one-time, short-lived,
+and omitted from normal server logs except for the existing abbreviated
+primary-token summary.
 
 ### `POST /solve-challenge` — clear "Just a moment..."
 
